@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package castor.media.v1;
+
+import "buf/validate/validate.proto";
+import "castor/v1/cast.proto";
+import "castor/v1/stream.proto";
+
+// CastService starts, stops and follows casts.
+service CastService {
+  // Start begins a cast and returns at once; it plays once a device is lent to it through DeviceService.
+  rpc Start(StartRequest) returns (StartResponse);
+  // Stop ends a cast and returns at once.
+  rpc Stop(StopRequest) returns (StopResponse);
+  // Watch follows a cast without driving it, as the public CastService.Watch does.
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc Watch(castor.v1.WatchRequest) returns (stream castor.v1.WatchResponse);
+}
+
+message StartRequest {
+  // cast_id is the API server's id for the cast, the one every tier logs it under; devices fetch what the cast serves by it.
+  string cast_id = 1 [(buf.validate.field).string.pattern = "^[A-Z2-7]{26}$"];
+  // source is a direct stream or resolved candidates, never unresolved pages.
+  Source source = 2 [(buf.validate.field).required = true];
+  PlaybackSettings settings = 3 [(buf.validate.field).required = true];
+}
+
+// PlaybackSettings is the complete policy resolved by API before media is called.
+message PlaybackSettings {
+  castor.v1.Delivery delivery = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  uint32 max_height = 2 [(buf.validate.field).uint32.gte = 2];
+  castor.v1.SubtitleSelection subtitles = 3 [(buf.validate.field).required = true];
+  castor.v1.AudioSelection audio = 4;
+}
+
+message StartResponse {}
+
+message StopRequest {
+  string cast_id = 1 [(buf.validate.field).string.min_len = 1];
+}
+
+message StopResponse {}
+
+// Source is a direct stream or extracted candidates to measure, rank, and play.
+message Source {
+  oneof source {
+    option (buf.validate.oneof).required = true;
+    castor.v1.Stream stream = 1;
+    Streams streams = 2;
+  }
+  message Streams {
+    repeated castor.v1.StreamCandidate streams = 1 [
+      (buf.validate.field).repeated.min_items = 1,
+      (buf.validate.field).repeated.max_items = 1600
+    ];
+  }
+}

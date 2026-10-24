@@ -1,0 +1,15 @@
+# A page-restricted stream keeps its headers across API -> scraping -> media, embedded or split (#53).
+topology: [embedded, split]
+command: player
+stream:
+  packaging: hls-ts
+  video: {codec: h264, height: 240}
+  audio: {codec: aac, channels: 2}
+  seconds: 300
+origin:
+  requires-referer: {}
+receiver:
+  device: chromecast
+expect:
+  delivery: served
+  video: copied

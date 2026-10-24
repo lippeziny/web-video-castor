@@ -1,0 +1,89 @@
+name: continuous-integration
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
+        with:
+          version: 1.73.0
+          setup_only: true
+      - run: node .yarn/releases/yarn-4.18.1.cjs install --immutable
+      - run: node .yarn/releases/yarn-4.18.1.cjs workspace castor-app generate
+      - run: test -z "$(git status --porcelain -- app/src/gen)"
+      - run: node .yarn/releases/yarn-4.18.1.cjs workspace castor-app typecheck
+      - run: node .yarn/releases/yarn-4.18.1.cjs workspace castor-app lint
+      - run: node .yarn/releases/yarn-4.18.1.cjs workspace castor-app test
+      - run: node .yarn/releases/yarn-4.18.1.cjs workspace castor-app build
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - uses: ./.github/actions/setup
+      # The real-encode tests need ffmpeg >= 7.1 (allowed_segment_extensions); apt's 6.1 lacks it. tested.sh fails on their skip.
+      - run: |
+          curl -fsSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz | sudo tar -xJ --strip-components=2 -C /usr/local/bin --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+      - run: |
+          eval "$(make env)"
+          TEST_CASTOR_CHROME="$(command -v google-chrome)"
+          export TEST_CASTOR_CHROME
+          ./scripts/tested.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - uses: ./.github/actions/setup
+      - run: eval "$(make env)" && go vet ./services/... ./internal/... ./cmd/... ./e2e/...
+      # Pinned so a new release never turns an unrelated push red; gen/ is buf's.
+      - run: eval "$(make env)" && go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 -checks all ./services/... ./internal/... ./cmd/... ./e2e/...
+      # deadcode always exits 0, so its output is the gate; castorNativeLog is called only from C.
+      - run: |
+          eval "$(make env)"
+          dead=$(go run golang.org/x/tools/cmd/deadcode@v0.51.0 -test ./services/... ./internal/... ./cmd/... ./e2e/...)
+          dead=$(printf '%s' "$dead" | sed '/^services\/mediaserver\/internal\/subtitle\/whisper\/nativelog.go:[0-9]*:[0-9]*: unreachable func: castorNativeLog$/d')
+          [ -z "$dead" ] || { printf 'unreachable:\n%s\n' "$dead"; exit 1; }
+      # Fails with the diff it suggests: run `go fix ./...` and commit it.
+      - run: eval "$(make env)" && go fix -diff ./services/... ./internal/... ./cmd/... ./e2e/...
+      # cgo stays in the media server, so the API server alone still cross-compiles anywhere.
+      - run: CGO_ENABLED=0 go build ./services/apiserver/...
+      - run: CGO_ENABLED=0 go build ./services/scrapingserver/...
+      - run: |
+          unformatted=$(gofmt -s -l services cmd internal e2e)
+          [ -z "$unformatted" ] || { printf 'unformatted:\n%s\n' "$unformatted"; exit 1; }
+
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
+        with:
+          version: 1.73.0
+          setup_only: true
+      - run: buf lint && buf format -d --exit-code
+      - run: buf breaking --against '.git#branch=origin/main' --path proto/castor/v1
+      - run: make generate && test -z "$(git status --porcelain -- gen)"

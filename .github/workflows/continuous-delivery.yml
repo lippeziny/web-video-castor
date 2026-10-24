@@ -1,0 +1,43 @@
+name: continuous-delivery
+
+# Merging release-please's PR tags a release and delivers it in the same run, so no PAT bridges the tag.
+
+on:
+  push:
+    branches: [ main ]
+
+permissions: {}
+
+concurrency:
+  group: cd
+  cancel-in-progress: false
+
+jobs:
+  please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      version: ${{ steps.release.outputs.tag_name }}
+      released: ${{ steps.release.outputs.releases_created }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  delivery:
+    needs: please
+    if: needs.please.outputs.released == 'true'
+    uses: ./.github/workflows/_delivery.yml
+    secrets:
+      HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    with:
+      version: ${{ needs.please.outputs.version }}

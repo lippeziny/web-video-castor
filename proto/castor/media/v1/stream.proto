@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package castor.media.v1;
+
+import "buf/validate/validate.proto";
+import "castor/media/v1/cast.proto";
+import "castor/v1/stream.proto";
+
+// StreamService ranks a source's streams as a cast would, without casting.
+service StreamService {
+  rpc Rank(RankRequest) returns (RankResponse);
+}
+
+message RankRequest {
+  Source source = 1 [(buf.validate.field).required = true];
+  PlaybackSettings settings = 2 [(buf.validate.field).required = true];
+}
+
+message RankResponse {
+  // ranked is the order a cast walks the streams in, best first.
+  repeated castor.v1.RankedStream ranked = 1;
+}

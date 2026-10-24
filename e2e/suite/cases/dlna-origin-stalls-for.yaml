@@ -1,0 +1,18 @@
+# An origin that goes quiet for longer than the device has buffered: castor holds the device before it runs dry, and lets it play on once the read is ahead again.
+stream:
+  packaging: hls-ts
+  video: {codec: h264, height: 360}
+  audio: {codec: aac, channels: 2}
+  seconds: 60
+origin:
+  stalls-for: {at: 40, seconds: 45}
+receiver:
+  device:
+    dlna:
+      sink: "http-get:*:video/mp2t:DLNA.ORG_PN=AVC_TS_HD_AAC_ISO,http-get:*:audio/mp4:DLNA.ORG_PN=AAC_ISO"
+      decodes:
+        video: {h264: 8}
+        audio: {aac: 2}
+expect:
+  delivery: served
+  video: copied

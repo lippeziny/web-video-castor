@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package castor.v1;
+
+import "buf/validate/validate.proto";
+
+// DeviceService finds the devices on the network.
+service DeviceService {
+  // ListDevices discovers the devices this server reaches, within its network timeout.
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+}
+
+message ListDevicesRequest {}
+
+message ListDevicesResponse {
+  repeated Device devices = 1;
+}
+
+message Device {
+  // id is opaque and the same on every discovery; a cast's target names it.
+  string id = 1;
+  string name = 2;
+  DeviceType type = 3 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  string address = 4;
+}
+
+// Target is the device a cast plays on: one discovered, or one pinned where discovery cannot see.
+message Target {
+  oneof target {
+    option (buf.validate.oneof).required = true;
+    string device_id = 1 [(buf.validate.field).string.min_len = 1];
+    Pinned pinned = 2;
+  }
+
+  message Pinned {
+    // type is the device's family, as Device.type reports it.
+    DeviceType type = 1 [(buf.validate.field).enum = {
+      defined_only: true
+      not_in: [0]
+    }];
+    // address is a host, a host:port, or the URL the family answers at.
+    string address = 2 [(buf.validate.field).string.min_len = 1];
+  }
+}
+
+enum DeviceType {
+  DEVICE_TYPE_UNSPECIFIED = 0;
+  DEVICE_TYPE_DLNA = 1;
+  DEVICE_TYPE_CHROMECAST = 2;
+  DEVICE_TYPE_ROKU = 3;
+}

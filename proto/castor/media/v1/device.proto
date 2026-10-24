@@ -1,0 +1,315 @@
+syntax = "proto3";
+
+package castor.media.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/descriptor.proto";
+
+// DeviceService lends a device to a cast: its lender holds it for the whole cast, playing what the cast asks through Drive and answering through Answer.
+service DeviceService {
+  // Drive lends the Device: a cast takes one, starts once it is lent, and plays on once its lender leaves.
+  rpc Drive(DriveRequest) returns (stream DriveResponse);
+  rpc Answer(AnswerRequest) returns (AnswerResponse);
+}
+
+message DriveRequest {
+  string cast_id = 1 [(buf.validate.field).string.min_len = 1];
+  // capabilities are the lent device's, read once its lender has connected to it for the whole cast.
+  Capabilities capabilities = 2 [(buf.validate.field).required = true];
+}
+
+message DriveResponse {
+  DeviceCommand command = 1 [(buf.validate.field).required = true];
+}
+
+message AnswerRequest {
+  string cast_id = 1 [(buf.validate.field).string.min_len = 1];
+  string command_id = 2 [(buf.validate.field).string.min_len = 1];
+  oneof answer {
+    option (buf.validate.oneof).required = true;
+    Done done = 3;
+    DeviceError error = 4;
+  }
+
+  message Done {}
+}
+
+message AnswerResponse {}
+
+// Capabilities is what a device decodes natively and how it takes a stream.
+message Capabilities {
+  // Atomic playback envelopes in preference order; the first is the default.
+  repeated FormatSupport formats = 1 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 128
+  }];
+  string provenance = 2;
+  bool deinterlaces = 3;
+  // served_headers are set on every response the device fetches what it is served from.
+  map<string, string> served_headers = 4 [(buf.validate.field).map = {
+    keys: {
+      string: {well_known_regex: KNOWN_REGEX_HTTP_HEADER_NAME}
+    }
+    values: {
+      string: {
+        well_known_regex: KNOWN_REGEX_HTTP_HEADER_VALUE
+        strict: false
+      }
+    }
+  }];
+  // self_fetch is whether the device fetches a stream URL itself, rather than only playing what it is served.
+  bool self_fetch = 5;
+}
+
+message FormatSupport {
+  oneof transport {
+    option (buf.validate.oneof).required = true;
+    ProgressiveSupport progressive = 1;
+    HLSSupport hls = 2;
+  }
+  oneof tracks {
+    option (buf.validate.oneof).required = true;
+    VideoSupport video = 3;
+    AudioSupport audio = 4;
+    AVSupport av = 5;
+  }
+  // Complete subtitle documents fetched separately from media.
+  repeated CaptionFormat captions = 6 [(buf.validate.field).repeated.items.enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+}
+
+message AVSupport {
+  VideoSupport video = 1 [(buf.validate.field).required = true];
+  AudioSupport audio = 2 [(buf.validate.field).required = true];
+}
+
+message ProgressiveSupport {
+  enum Container {
+    CONTAINER_UNSPECIFIED = 0;
+    CONTAINER_MP4 = 1;
+    CONTAINER_MPEGTS = 2;
+    CONTAINER_MKV = 3;
+    CONTAINER_WEBM = 4;
+  }
+  Container container = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+}
+
+message HLSSupport {
+  enum Subtitles {
+    SUBTITLES_UNSPECIFIED = 0;
+    SUBTITLES_WEBVTT = 1;
+  }
+  // Subtitle rendition playlists refreshed alongside the media playlist.
+  Subtitles subtitles = 1 [(buf.validate.field).enum.defined_only = true];
+  enum ExtraSegmentFormat {
+    EXTRA_SEGMENT_FORMAT_UNSPECIFIED = 0;
+    EXTRA_SEGMENT_FORMAT_TIKTIKPX = 1; // PNG/gzip/MPEG-TS envelope
+  }
+  // Nonstandard segment formats accepted in addition to ordinary HLS segments.
+  repeated ExtraSegmentFormat extra_segment_formats = 2 [(buf.validate.field).repeated = {
+    max_items: 16
+    unique: true
+    items: {
+      enum: {
+        not_in: [0]
+      }
+    }
+  }];
+}
+
+message VideoSupport {
+  oneof codec {
+    option (buf.validate.oneof).required = true;
+    H264Support h264 = 1;
+    HEVCSupport hevc = 2;
+    VP8Support vp8 = 3;
+  }
+}
+
+message H264Support {
+  enum Profile {
+    PROFILE_UNSPECIFIED = 0;
+    PROFILE_CONSTRAINED_BASELINE = 1;
+    PROFILE_BASELINE = 2;
+    PROFILE_MAIN = 3;
+    PROFILE_HIGH = 4;
+  }
+  // Empty means any H.264 profile within the advertised level.
+  repeated Profile profiles = 1 [(buf.validate.field).repeated = {
+    max_items: 4
+    unique: true
+    items: {
+      enum: {
+        defined_only: true
+        not_in: [0]
+      }
+    }
+  }];
+  uint32 max_level = 2;
+}
+
+message HEVCSupport {
+  enum Profile {
+    PROFILE_UNSPECIFIED = 0;
+    PROFILE_MAIN = 1;
+    PROFILE_MAIN_10 = 2;
+  }
+  // Empty means any HEVC profile at the advertised bit depths.
+  repeated Profile profiles = 1 [(buf.validate.field).repeated = {
+    max_items: 2
+    unique: true
+    items: {
+      enum: {
+        defined_only: true
+        not_in: [0]
+      }
+    }
+  }];
+  // Empty means 8-bit only.
+  repeated uint32 bit_depths = 2 [(buf.validate.field).repeated = {
+    max_items: 3
+    unique: true
+    items: {
+      uint32: {
+        in: [
+          8,
+          10,
+          12
+        ]
+      }
+    }
+  }];
+  uint32 max_level = 3;
+}
+
+message VP8Support {}
+
+message AudioSupport {
+  AudioCodec codec = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  uint32 max_channels = 2;
+}
+
+// CaptionFormat is how a caption track is written.
+enum CaptionFormat {
+  CAPTION_FORMAT_UNSPECIFIED = 0;
+  CAPTION_FORMAT_VTT = 1;
+  CAPTION_FORMAT_SRT = 2;
+}
+
+// Container is how a stream is packaged, as a device takes it.
+enum Container {
+  CONTAINER_UNSPECIFIED = 0;
+  CONTAINER_MP4 = 1 [(mime) = "video/mp4"];
+  CONTAINER_MPEGTS = 2 [(mime) = "video/mp2t"];
+  CONTAINER_HLS = 3 [(mime) = "application/x-mpegURL"];
+  CONTAINER_MKV = 4 [(mime) = "video/x-matroska"];
+  CONTAINER_WEBM = 5 [(mime) = "video/webm"];
+}
+
+extend google.protobuf.EnumValueOptions {
+  // mime is the content type a container is served and named as, on both sides of the contract.
+  string mime = 51000;
+}
+
+enum AudioCodec {
+  AUDIO_CODEC_UNSPECIFIED = 0;
+  AUDIO_CODEC_AAC = 1;
+  AUDIO_CODEC_AC3 = 2;
+  AUDIO_CODEC_EAC3 = 3;
+  AUDIO_CODEC_MP3 = 4;
+  AUDIO_CODEC_VORBIS = 5;
+}
+
+// DeviceCommand is one call a cast makes on the device lent to it.
+message DeviceCommand {
+  oneof command {
+    option (buf.validate.oneof).required = true;
+    Call call = 1;
+    // Cancellation identifies an existing call and is never answered.
+    Cancel cancel = 2;
+  }
+
+  message Call {
+    string id = 1 [(buf.validate.field).string.min_len = 1];
+    oneof operation {
+      option (buf.validate.oneof).required = true;
+      Play play = 2;
+      AwaitEnd await_end = 3;
+      Pause pause = 4;
+      Resume resume = 5;
+    }
+  }
+
+  message Play {
+    // url is what the device fetches: the source itself, or what the media server serves it.
+    string url = 1 [
+      (buf.validate.field).string.max_len = 8192,
+      (buf.validate.field).cel = {
+        id: "play.url.http"
+        message: "must be an http or https URL"
+        expression: "this.isUri() && (this.startsWith('http://') || this.startsWith('https://'))"
+      }
+    ];
+    Container container = 2 [(buf.validate.field).enum = {
+      defined_only: true
+      not_in: [0]
+    }];
+    repeated Caption captions = 3;
+  }
+
+  // Caption is a text track the device shows over the stream; its url is fetched like the stream's.
+  message Caption {
+    string url = 1 [
+      (buf.validate.field).string.max_len = 8192,
+      (buf.validate.field).cel = {
+        id: "caption.url.http"
+        message: "must be an http or https URL"
+        expression: "this.isUri() && (this.startsWith('http://') || this.startsWith('https://'))"
+      }
+    ];
+    CaptionFormat format = 2 [(buf.validate.field).enum = {
+      defined_only: true
+      not_in: [0]
+    }];
+    // language is the ISO 639 code the track is tagged with, empty when untagged.
+    string language = 3;
+    string name = 4;
+    // default is shown without the viewer choosing it.
+    bool default = 5;
+  }
+
+  message AwaitEnd {}
+
+  message Pause {}
+
+  message Resume {}
+
+  message Cancel {
+    string command_id = 1 [(buf.validate.field).string.min_len = 1];
+  }
+}
+
+// DeviceError is a device's failure, typed where the cast's recovery reads its kind.
+message DeviceError {
+  oneof error {
+    option (buf.validate.oneof).required = true;
+    string message = 1 [(buf.validate.field).string.min_len = 1];
+    Gone gone = 2;
+  }
+
+  // Gone is a device established unreachable.
+  message Gone {
+    // device names the device that went.
+    string device = 1;
+    string observed = 2;
+    string cause = 3;
+  }
+}

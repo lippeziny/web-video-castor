@@ -1,0 +1,244 @@
+name: _delivery
+
+# Builds and publishes one version; a version with a `-` is a prerelease, which moves only `:canary`.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version to ship: the release tag (v1.4.4) or a canary (1.4.4-canary.abc1234)."
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_GITHUB_TOKEN:
+        description: Token for pushing the rendered cask to the Homebrew tap (stable only).
+        required: false
+
+permissions: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: zcc
+            cxx: zxx
+            zig_triple: x86_64-linux-gnu.2.17
+            cmake_args: >-
+              -DCMAKE_SYSTEM_NAME=Linux
+              -DCMAKE_SYSTEM_PROCESSOR=x86_64
+              -DCMAKE_C_COMPILER=zcc
+              -DCMAKE_CXX_COMPILER=zxx
+          - target: linux-arm64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            cc: zcc
+            cxx: zxx
+            zig_triple: aarch64-linux-gnu.2.17
+            cmake_args: >-
+              -DCMAKE_SYSTEM_NAME=Linux
+              -DCMAKE_SYSTEM_PROCESSOR=aarch64
+              -DCMAKE_C_COMPILER=zcc
+              -DCMAKE_CXX_COMPILER=zxx
+          # zig's own archiver, since the host binutils need not index COFF objects.
+          - target: windows-amd64
+            runner: ubuntu-latest
+            goos: windows
+            goarch: amd64
+            cc: zcc
+            cxx: zxx
+            zig_triple: x86_64-windows-gnu
+            cmake_args: >-
+              -DCMAKE_SYSTEM_NAME=Windows
+              -DCMAKE_SYSTEM_PROCESSOR=x86_64
+              -DCMAKE_C_COMPILER=zcc
+              -DCMAKE_CXX_COMPILER=zxx
+              -DCMAKE_AR=/usr/local/bin/zar
+              -DCMAKE_RANLIB=/usr/local/bin/zranlib
+          - target: windows-arm64
+            runner: ubuntu-latest
+            goos: windows
+            goarch: arm64
+            cc: zcc
+            cxx: zxx
+            zig_triple: aarch64-windows-gnu
+            cmake_args: >-
+              -DCMAKE_SYSTEM_NAME=Windows
+              -DCMAKE_SYSTEM_PROCESSOR=ARM64
+              -DCMAKE_C_COMPILER=zcc
+              -DCMAKE_CXX_COMPILER=zxx
+              -DCMAKE_AR=/usr/local/bin/zar
+              -DCMAKE_RANLIB=/usr/local/bin/zranlib
+          - target: darwin-amd64
+            runner: macos-latest
+            goos: darwin
+            goarch: amd64
+            cc: clang -arch x86_64
+            cxx: clang++ -arch x86_64
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES=x86_64 -DGGML_METAL_EMBED_LIBRARY=ON
+          - target: darwin-arm64
+            runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES=arm64 -DGGML_METAL_EMBED_LIBRARY=ON
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      WHISPER: ${{ github.workspace }}/third_party/whisper.cpp
+      BUILD: ${{ github.workspace }}/third_party/whisper.cpp/build_go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: matrix.zig_triple
+        with:
+          version: 0.15.1
+      - if: matrix.zig_triple
+        run: |
+          printf '#!/bin/sh\nexec zig cc  -target ${{ matrix.zig_triple }} "$@"\n' | sudo tee /usr/local/bin/zcc > /dev/null
+          printf '#!/bin/sh\nexec zig c++ -target ${{ matrix.zig_triple }} "$@"\n' | sudo tee /usr/local/bin/zxx > /dev/null
+          printf '#!/bin/sh\nexec zig ar "$@"\n' | sudo tee /usr/local/bin/zar > /dev/null
+          printf '#!/bin/sh\nexec zig ranlib "$@"\n' | sudo tee /usr/local/bin/zranlib > /dev/null
+          sudo chmod +x /usr/local/bin/zcc /usr/local/bin/zxx /usr/local/bin/zar /usr/local/bin/zranlib
+      - run: |
+          cmake -S "$WHISPER" -B "$BUILD" \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DGGML_NATIVE=OFF \
+            ${{ matrix.cmake_args }}
+          cmake --build "$BUILD" --target whisper -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)"
+      # ggml drops the lib prefix on Windows, but the binding's -lggml looks for libggml.a.
+      - if: matrix.goos == 'windows'
+        run: for lib in "$BUILD"/ggml/src/ggml*.a; do cp "$lib" "${lib%/*}/lib${lib##*/}"; done
+      - env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          export CGO_CFLAGS="-I$WHISPER/include -I$WHISPER/ggml/include"
+          export CGO_LDFLAGS="-L$BUILD/src -L$BUILD/ggml/src -L$BUILD/ggml/src/ggml-blas -L$BUILD/ggml/src/ggml-metal"
+          ldflags="-s -w -X github.com/stupside/castor/cmd/internal/process.version=${VERSION}"
+          go build -trimpath -ldflags "$ldflags" -o dist/castor ./cmd/castor
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: castor-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      IMAGE: ghcr.io/stupside/castor
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: castor-*
+          path: prebuilt
+      - run: ./scripts/release.sh
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=latest,enable=${{ !contains(inputs.version, '-') }}
+            type=raw,value=canary,enable=${{ contains(inputs.version, '-') }}
+          labels: |
+            org.opencontainers.image.description=Cast video streams to networked devices
+            org.opencontainers.image.licenses=MIT
+      - uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        with:
+          # The workspace, not the git tree: release.sh staged the binaries in docker/<arch>/.
+          source: .
+          files: |
+            ./docker-bake.hcl
+            ${{ steps.meta.outputs.bake-file }}
+          push: true
+
+      # Stable only: attach the archives to the Release release-please created.
+      - if: ${{ !contains(inputs.version, '-') }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: dist/*
+          tag_name: ${{ inputs.version }}
+          fail_on_unmatched_files: true
+      # The cask pins these exact archives, which tar does not rebuild byte for byte.
+      - if: ${{ !contains(inputs.version, '-') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  npm:
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: castor-*
+          path: prebuilt
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # Trusted publishing needs npm 11.5.1+, which Node 24 ships.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: ./scripts/npm/publish.ts
+        env:
+          VERSION: ${{ inputs.version }}
+
+  brew:
+    needs: publish
+    if: ${{ !contains(inputs.version, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - run: ./scripts/brew/brew.sh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

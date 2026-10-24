@@ -1,0 +1,43 @@
+name: canary-release
+
+# Publishes <next-patch>-canary.<sha> from any branch; the `-` keeps _delivery off every stable pointer.
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compute canary version
+        id: v
+        run: |
+          set -euo pipefail
+          base=$(jq -r '."."' .release-please-manifest.json)
+          next="${base%.*}.$(( ${base##*.} + 1 ))"
+          version="${next}-canary.$(git rev-parse --short HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: version
+    uses: ./.github/workflows/_delivery.yml
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    with:
+      version: ${{ needs.version.outputs.version }}

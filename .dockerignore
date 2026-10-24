@@ -1,0 +1,7 @@
+# The release image needs only its Dockerfile and the staged Linux binaries.
+# Keep sources, dependencies, native build caches, and local secrets out.
+**
+!Dockerfile
+!docker/
+!docker/*/
+!docker/*/castor

@@ -1,0 +1,27 @@
+.claude
+
+.DS_Store
+
+# Personal config override (keeps private sources/paths out of version control)
+config.local.yaml
+
+# Built castor binaries (produced by `make build`)
+/castor
+
+# whisper.cpp cmake artifacts (`make lib`)
+third_party/whisper.cpp/build_*/
+
+# zig cache (created by mlugg/setup-zig in CI)
+.zig-cache/
+
+# docker compose secrets (tokens)
+.env
+
+# Next.js app tier
+node_modules/
+.next/
+app/.env*
+next-env.d.ts
+.yarn/*
+!.yarn/releases
+app/.yarn/

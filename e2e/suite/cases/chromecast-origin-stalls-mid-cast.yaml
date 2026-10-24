@@ -1,0 +1,12 @@
+# An origin that stalls for good after the hand-off: the device is held while castor waits, then the cast ends with an error rather than hanging.
+stream:
+  packaging: hls-ts
+  video: {codec: h264, height: 360}
+  audio: {codec: aac, channels: 2}
+  segments: {extension: .jpg, served_as: image/jpeg}
+  seconds: 60
+origin:
+  stalls-at: 40
+receiver:
+  device: chromecast
+outcome: aborted
