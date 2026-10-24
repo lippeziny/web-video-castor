@@ -1,6 +1,6 @@
 # Castor Android
 
-Versão do app: **2.2.3**. Consulte `CHANGELOG-2.2.3.md` para as alterações e os testes executados.
+Versão do app: **2.2.4**. Consulte `CHANGELOG-2.2.4.md` para a correção de compilação. Os testes de protocolo da versão 2.2.3 permanecem descritos em `CHANGELOG-2.2.3.md`.
 
 # Castor Android Browser 2.2
 

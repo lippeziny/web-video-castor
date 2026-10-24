@@ -60,7 +60,7 @@ public final class PlayerActivity extends AppCompatActivity {
     private TextView timeText;
     private TextView playBtn;
     private TextView seekFeedback;
-    private View controls;
+    private FrameLayout controls;
     private SeekBar seekBar;
     private Player.Listener playbackListener;
     private int initialIndex;
