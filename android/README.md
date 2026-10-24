@@ -1,4 +1,4 @@
-# Castor Android Browser 2.1
+# Castor Android Browser 2.2
 
 Navegador Android (Java + WebView + Media3/ExoPlayer) com detecção de vídeos, fila de reprodução e bloqueio de anúncios, pop-ups e redirecionamentos.
 
@@ -9,6 +9,17 @@ Navegador Android (Java + WebView + Media3/ExoPlayer) com detecção de vídeos,
 - **Painel Block ADS:** chaves *Popup*, *Redirect* e *Ads* (todas ligadas por padrão), botão **Force search** (força a busca de vídeos na página), modo desktop e engrenagem de **mais configurações**.
 - **Página inicial** com atalhos de serviços (Google, YouTube, Prime Video etc.).
 - **Aviso de bloqueio:** mostra o link com **Abrir** / **Ignorar**; some em 3 s (configurável de 0 a 15 s; 0 = fica até escolher).
+
+## Novidades da 2.2 (v4)
+
+- **Player em segundo plano:** a reprodução interna passou para `MediaSessionService` (Media3), com sessão de mídia, notificação/controlos do sistema e suporte a continuar com a tela apagada. A compatibilidade final depende do fabricante e das configurações de bateria do Android.
+- **Qualidade e idioma:** a lista de vídeos mostra a resolução quando o elemento de vídeo informa `videoWidth`/`videoHeight` ou quando a resolução é identificável na URL. Idioma de áudio/legenda aparece quando o navegador expõe esses metadados; em outros casos, o app informa que a fonte não disponibilizou a informação.
+- **Reprodução automática opcional:** em Configurações, pode ativar a reprodução automática quando uma fonte de vídeo é detectada. Por padrão, ela fica desligada. A preferência de qualidade permite tentar a maior disponível, limitar a média (até 720p) ou baixa (até 480p) em fontes adaptativas. Arquivos de qualidade fixa não podem ser convertidos magicamente para outra resolução.
+- **Áudio e cast:** o player define atributos de áudio e mantém os cabeçalhos `Referer`/`Origin` por item. O cast envia o MIME correspondente e o áudio que já faz parte do arquivo/stream; isso não converte formatos nem remove DRM. A compatibilidade depende dos codecs suportados pela TV/receptor.
+- **Aparência:** tema Claro, Escuro e AMOLED de preto puro; a seleção fica salva.
+- **Volume da TV:** os botões físicos de volume durante um cast ativo e o controle deslizante na tela do cast ajustam DLNA/UPnP RenderingControl ou Chromecast quando disponível. Dispositivos/servidores que não oferecem esse controle não conseguem ser ajustados pelo app.
+- **Ícone por imagem:** em Configurações pode escolher uma imagem e pedir ao Android para fixar um atalho Castor com esse ícone na tela inicial. Isso não substitui o ícone do pacote instalado, pois essa troca não é suportada de modo universal pelos launchers.
+- **Proteção durante cast:** o serviço de cast mantém `WakeLock` parcial e `WifiLock` enquanto está ativo para reduzir interrupções com a tela apagada. Alguns fabricantes ainda podem encerrar processos por economia de bateria.
 
 ## Novidades da 2.1
 
@@ -37,7 +48,7 @@ Requisitos do build: JDK 17, Gradle 8.13, Android SDK 36 (o workflow já configu
 
 - Não contorna DRM. Sites como Prime Video/Netflix e vídeos `blob:` sem link direto não podem ser extraídos.
 - O servidor Go original do Castor (api/media/scraping) **não** roda dentro do app: ele depende de Chrome e ffmpeg, que não existem no Android. Use a opção de servidor remoto acima.
-- Cast: o app envia o link do vídeo (via proxy) e a TV decodifica. Formatos que a TV não suporta (ex.: MKV/HEVC em algumas) não são convertidos no modo nativo; só o servidor remoto converte. O cast não foi testado em hardware real.
+- Cast: o app envia o link do vídeo (via proxy) e a TV decodifica. Formatos que a TV não suporta (ex.: MKV/HEVC em algumas) não são convertidos no modo nativo; só o servidor remoto converte. O cast, áudio e controle de volume precisam ser testados com a TV/receptor real; este pacote não foi validado em hardware real.
 - A descoberta de TVs não atravessa VLANs/sub-redes; celular e TV precisam estar na mesma rede.
 - Gera APK de depuração (sem assinatura de release).
-- O código foi escrito sem compilar neste ambiente: se o build do GitHub acusar erro, envie o log para correção.
+- Neste ambiente de edição não havia Android SDK nem Gradle disponíveis, e não foi possível baixá-los. Portanto, o APK não foi compilado aqui; execute o workflow do GitHub para validar o build. Também é necessário testar com uma TV real para confirmar os protocolos, o áudio e o volume suportados pelo seu modelo.

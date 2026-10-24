@@ -103,19 +103,25 @@ public final class DlnaClient {
         String name = text(doc.getElementsByTagName("friendlyName"));
         String udn = text(doc.getElementsByTagName("UDN"));
         NodeList services = doc.getElementsByTagName("service");
+        URL base = new URL(location);
+        String avtControl = "", avtService = "", renderControl = "", renderService = "";
         for (int i = 0; i < services.getLength(); i++) {
             Element s = (Element) services.item(i);
             String type = text(s.getElementsByTagName("serviceType"));
-            if (type != null && type.contains(":service:AVTransport:")) {
-                String ctl = text(s.getElementsByTagName("controlURL"));
-                if (ctl == null) continue;
-                URL base = new URL(location);
-                String abs = new URL(base, ctl).toString();
-                return new CastDevice(CastDevice.DLNA, "dlna:" + (udn != null ? udn : location),
-                        name, base.getHost(), base.getPort(), abs, type);
+            String ctl = text(s.getElementsByTagName("controlURL"));
+            if (type == null || ctl == null) continue;
+            String abs = new URL(base, ctl).toString();
+            if (type.contains(":service:AVTransport:")) {
+                avtControl = abs;
+                avtService = type;
+            } else if (type.contains(":service:RenderingControl:")) {
+                renderControl = abs;
+                renderService = type;
             }
         }
-        return null;
+        if (avtControl.isEmpty()) return null;
+        return new CastDevice(CastDevice.DLNA, "dlna:" + (udn != null ? udn : location),
+                name, base.getHost(), base.getPort(), avtControl, avtService, renderControl, renderService);
     }
 
     private static String text(NodeList l) {
@@ -146,11 +152,13 @@ public final class DlnaClient {
     // ---------------------------------------------------------------- controle
 
     public static void setUri(CastDevice d, String url, String title, String mime) throws IOException {
+        boolean audio = mime != null && mime.toLowerCase(Locale.ROOT).startsWith("audio/");
+        String objectClass = audio ? "object.item.audioItem.musicTrack" : "object.item.videoItem";
         String didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" "
                 + "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
                 + "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
                 + "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>" + esc(title) + "</dc:title>"
-                + "<upnp:class>object.item.videoItem</upnp:class>"
+                + "<upnp:class>" + objectClass + "</upnp:class>"
                 + "<res protocolInfo=\"http-get:*:" + esc(mime) + ":*\">" + esc(url) + "</res></item></DIDL-Lite>";
         soap(d, "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>" + esc(url)
                 + "</CurrentURI><CurrentURIMetaData>" + esc(didl) + "</CurrentURIMetaData>");
@@ -195,15 +203,39 @@ public final class DlnaClient {
         }
     }
 
+    public static int getVolume(CastDevice d) throws IOException {
+        if (d.renderingControl.isEmpty()) throw new IOException("A TV não anuncia controle de volume DLNA");
+        String svc = d.renderingService.isEmpty()
+                ? "urn:schemas-upnp-org:service:RenderingControl:1" : d.renderingService;
+        String response = soapAt(d.renderingControl, svc, "GetVolume",
+                "<InstanceID>0</InstanceID><Channel>Master</Channel>");
+        String value = tag(response, "CurrentVolume");
+        if (value == null) throw new IOException("A TV não retornou o volume atual");
+        try { return Math.max(0, Math.min(100, Integer.parseInt(value.trim()))); }
+        catch (NumberFormatException e) { throw new IOException("Volume DLNA inválido", e); }
+    }
+
+    public static void setVolume(CastDevice d, int volume) throws IOException {
+        if (d.renderingControl.isEmpty()) throw new IOException("A TV não anuncia controle de volume DLNA");
+        String svc = d.renderingService.isEmpty()
+                ? "urn:schemas-upnp-org:service:RenderingControl:1" : d.renderingService;
+        soapAt(d.renderingControl, svc, "SetVolume", "<InstanceID>0</InstanceID><Channel>Master</Channel>"
+                + "<DesiredVolume>" + Math.max(0, Math.min(100, volume)) + "</DesiredVolume>");
+    }
+
     private static String soap(CastDevice d, String action, String args) throws IOException {
         String svc = d.service.isEmpty() ? "urn:schemas-upnp-org:service:AVTransport:1" : d.service;
+        return soapAt(d.control, svc, action, args);
+    }
+
+    private static String soapAt(String controlUrl, String svc, String action, String args) throws IOException {
         String body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
                 + "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
                 + "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>"
                 + "<u:" + action + " xmlns:u=\"" + svc + "\">" + args + "</u:" + action + ">"
                 + "</s:Body></s:Envelope>";
         byte[] data = body.getBytes(StandardCharsets.UTF_8);
-        HttpURLConnection c = (HttpURLConnection) new URL(d.control).openConnection();
+        HttpURLConnection c = (HttpURLConnection) new URL(controlUrl).openConnection();
         c.setConnectTimeout(5000);
         c.setReadTimeout(8000);
         c.setRequestMethod("POST");

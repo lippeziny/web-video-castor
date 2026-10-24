@@ -31,6 +31,10 @@ public final class Store {
     private static final String K_CAST_PROXY = "cast_proxy";
     private static final String K_REMOTE_URL = "remote_url";
     private static final String K_REMOTE_TOKEN = "remote_token";
+    private static final String K_THEME = "theme_mode";
+    private static final String K_AUTO_PLAY = "auto_play";
+    private static final String K_QUALITY = "quality_mode";
+    private static final String K_CUSTOM_ICON = "custom_icon_uri";
     private static final int HISTORY_MAX = 300;
     private static final int POSITIONS_MAX = 400;
     private static final int TABS_MAX = 30;
@@ -47,6 +51,11 @@ public final class Store {
     public boolean desktop() { return p.getBoolean(K_DESKTOP, false); }
     public int noticeSeconds() { return p.getInt(K_SECONDS, 3); }
     public long filterTime() { return p.getLong(K_FILTER_TIME, 0L); }
+    public String theme() { return p.getString(K_THEME, "dark"); }
+    public boolean autoPlay() { return p.getBoolean(K_AUTO_PLAY, false); }
+    /** high, medium ou low */
+    public String quality() { return p.getString(K_QUALITY, "high"); }
+    public String customIconUri() { return p.getString(K_CUSTOM_ICON, ""); }
 
     public void setPopup(boolean v) { p.edit().putBoolean(K_POPUP, v).apply(); }
     public void setRedirect(boolean v) { p.edit().putBoolean(K_REDIRECT, v).apply(); }
@@ -54,6 +63,18 @@ public final class Store {
     public void setDesktop(boolean v) { p.edit().putBoolean(K_DESKTOP, v).apply(); }
     public void setNoticeSeconds(int v) { p.edit().putInt(K_SECONDS, v).apply(); }
     public void setFilterTime(long v) { p.edit().putLong(K_FILTER_TIME, v).apply(); }
+    public void setTheme(String v) {
+        if (!"light".equals(v) && !"amoled".equals(v)) v = "dark";
+        p.edit().putString(K_THEME, v).apply();
+    }
+    public void setAutoPlay(boolean v) { p.edit().putBoolean(K_AUTO_PLAY, v).apply(); }
+    public void setQuality(String v) {
+        if (!"medium".equals(v) && !"low".equals(v)) v = "high";
+        p.edit().putString(K_QUALITY, v).apply();
+    }
+    public void setCustomIconUri(String uri) {
+        p.edit().putString(K_CUSTOM_ICON, uri == null ? "" : uri).apply();
+    }
 
     // ---- transmissão (cast) ----
     public boolean castProxy() { return p.getBoolean(K_CAST_PROXY, true); }

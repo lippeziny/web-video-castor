@@ -2,15 +2,15 @@ package com.castor.mobile;
 
 import android.app.Activity;
 import android.app.PictureInPictureParams;
+import android.content.ComponentName;
 import android.content.Intent;
-import android.os.Build;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Rational;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -19,60 +19,56 @@ import android.widget.Toast;
 
 import androidx.annotation.OptIn;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.media3.common.MediaItem;
-import androidx.media3.common.MediaMetadata;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
-import androidx.media3.datasource.DefaultHttpDataSource;
-import androidx.media3.exoplayer.ExoPlayer;
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.session.MediaController;
+import androidx.media3.session.SessionToken;
 import androidx.media3.ui.PlayerView;
 
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Locale;
-import java.util.Set;
-import java.util.List;
-import java.util.Map;
+import com.google.common.util.concurrent.ListenableFuture;
 
-/** Player interno com fila (ExoPlayer/Media3): MP4, HLS (m3u8), DASH (mpd) e outros. */
+import java.util.List;
+import java.util.Locale;
+
+/** Interface do player. A reprodução real fica no MediaSessionService e continua fora desta tela. */
 @OptIn(markerClass = UnstableApi.class)
 public final class PlayerActivity extends AppCompatActivity {
     public static final String EXTRA_ITEMS = "items";
     public static final String EXTRA_INDEX = "index";
 
-    private ExoPlayer player;
+    private MediaController player;
+    private ListenableFuture<MediaController> controllerFuture;
     private PlayerView playerView;
     private List<com.castor.mobile.MediaItem> items;
     private Store store;
     private TextView castBtn;
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private final Set<Integer> resumed = new HashSet<>();
-    private int lastIndex = -1;
-    private final Runnable saver = new Runnable() {
-        @Override
-        public void run() {
-            saveCurrent();
-            handler.postDelayed(this, 5000);
-        }
-    };
+    private Player.Listener playbackListener;
+    private int initialIndex;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        store = new Store(this);
+        items = Store.queueFromJson(getIntent().getStringExtra(EXTRA_ITEMS));
+        initialIndex = getIntent().getIntExtra(EXTRA_INDEX, 0);
+        if (items.isEmpty()) {
+            Toast.makeText(this, "Nada para reproduzir", Toast.LENGTH_SHORT).show();
+            finish();
+            return;
+        }
+        if (initialIndex < 0 || initialIndex >= items.size()) initialIndex = 0;
 
         playerView = new PlayerView(this);
-        playerView.setBackgroundColor(0xFF000000);
+        playerView.setBackgroundColor(Color.BLACK);
         playerView.setShowNextButton(true);
         playerView.setShowPreviousButton(true);
-        store = new Store(this);
-
         FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(0xFF000000);
+        root.setBackgroundColor(Color.BLACK);
         root.addView(playerView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
         castBtn = new TextView(this);
         castBtn.setText("Cast");
         castBtn.setTextColor(Color.WHITE);
@@ -100,112 +96,52 @@ public final class PlayerActivity extends AppCompatActivity {
         });
         setContentView(root);
         hideSystemUi();
+        connectToPlaybackService();
+    }
 
-        Intent intent = getIntent();
-        items = Store.queueFromJson(intent.getStringExtra(EXTRA_ITEMS));
-        int start = intent.getIntExtra(EXTRA_INDEX, 0);
-        if (items.isEmpty()) {
-            Toast.makeText(this, "Nada para reproduzir", Toast.LENGTH_SHORT).show();
-            finish();
-            return;
-        }
-        if (start < 0 || start >= items.size()) start = 0;
+    private Intent playbackServiceIntent() {
+        return new Intent(this, PlaybackService.class)
+                .putExtra(EXTRA_ITEMS, Store.queueToJson(items))
+                .putExtra(EXTRA_INDEX, initialIndex);
+    }
 
-        // Cabeçalhos: muitos servidores de vídeo exigem Referer/User-Agent da página original.
-        final com.castor.mobile.MediaItem first = items.get(start);
-
-        DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
-                .setAllowCrossProtocolRedirects(true)
-                .setConnectTimeoutMs(15000)
-                .setReadTimeoutMs(20000)
-                .setUserAgent(MainActivity.USER_AGENT_MOBILE);
-
-        // Cada item pode ter seu próprio Referer: usamos uma fábrica que escolhe por URL.
-        final Map<String, String> refererByUrl = new HashMap<>();
-        for (com.castor.mobile.MediaItem m : items) refererByUrl.put(m.url, m.referer);
-        androidx.media3.datasource.DataSource.Factory perItem = () -> {
-            DefaultHttpDataSource ds = http.createDataSource();
-            return new androidx.media3.datasource.ResolvingDataSource(ds, (dataSpec) -> {
-                String ref = refererByUrl.get(dataSpec.uri.toString());
-                if (ref == null) ref = first.referer;
-                if (ref != null && !ref.isEmpty()) {
-                    ds.setRequestProperty("Referer", ref);
+    private void connectToPlaybackService() {
+        SessionToken token = new SessionToken(this, new ComponentName(this, PlaybackService.class));
+        controllerFuture = new MediaController.Builder(this, token).buildAsync();
+        controllerFuture.addListener(() -> {
+            try {
+                if (isFinishing() || isDestroyed()) return;
+                player = controllerFuture.get();
+                playerView.setPlayer(player);
+                playbackListener = new Player.Listener() {
+                    @Override public void onPlayerError(PlaybackException error) {
+                        Toast.makeText(PlayerActivity.this,
+                                "Erro ao reproduzir: " + error.getErrorCodeName(), Toast.LENGTH_LONG).show();
+                    }
+                };
+                player.addListener(playbackListener);
+                if (player.getMediaItemCount() == 0) {
+                    // Recuperação caso o Android tenha criado o serviço somente quando a tela conectou.
                     try {
-                        java.net.URI r = new java.net.URI(ref);
-                        ds.setRequestProperty("Origin", r.getScheme() + "://" + r.getHost());
-                    } catch (Exception ignored) {
+                        if (Build.VERSION.SDK_INT >= 26) startForegroundService(playbackServiceIntent());
+                        else startService(playbackServiceIntent());
+                    } catch (Exception e) {
+                        Toast.makeText(this, "Não foi possível iniciar o player em segundo plano", Toast.LENGTH_LONG).show();
+                    }
+                } else if (player.getCurrentMediaItemIndex() == initialIndex) {
+                    long[] saved = store.getPosition(keyOf(items.get(initialIndex)));
+                    if (saved != null && saved[0] > 0 && player.getCurrentPosition() < 10000) {
+                        toastResume(Math.max(0, saved[0] - 2000));
                     }
                 }
-                return dataSpec;
-            });
-        };
-
-        player = new ExoPlayer.Builder(this)
-                .setMediaSourceFactory(new DefaultMediaSourceFactory(perItem))
-                .build();
-        playerView.setPlayer(player);
-
-        for (com.castor.mobile.MediaItem m : items) {
-            MediaItem.Builder b = new MediaItem.Builder()
-                    .setUri(m.url)
-                    .setMediaMetadata(new MediaMetadata.Builder().setTitle(m.title).build());
-            player.addMediaItem(b.build());
-        }
-        player.addListener(new Player.Listener() {
-            @Override
-            public void onMediaItemTransition(MediaItem mediaItem, int reason) {
-                if (lastIndex >= 0 && lastIndex < items.size() && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
-                    // terminou o item anterior: não precisa lembrar onde parou
-                    store.clearPosition(keyOf(items.get(lastIndex)));
-                }
-                lastIndex = player.getCurrentMediaItemIndex();
-                if (!resumed.contains(lastIndex)) {
-                    resumed.add(lastIndex);
-                    long pos = savedPosition(lastIndex);
-                    if (pos > 0) {
-                        player.seekTo(lastIndex, pos);
-                        toastResume(pos);
-                    }
-                }
+            } catch (Exception e) {
+                Toast.makeText(PlayerActivity.this, "Falha ao conectar o player: " + e.getMessage(), Toast.LENGTH_LONG).show();
             }
-
-            @Override
-            public void onPlaybackStateChanged(int state) {
-                if (state == Player.STATE_ENDED && lastIndex >= 0 && lastIndex < items.size()) {
-                    store.clearPosition(keyOf(items.get(lastIndex)));
-                }
-            }
-
-            @Override
-            public void onPlayerError(PlaybackException error) {
-                Toast.makeText(PlayerActivity.this,
-                        "Erro ao reproduzir: " + error.getErrorCodeName(), Toast.LENGTH_LONG).show();
-                if (player.hasNextMediaItem()) {
-                    player.seekToNextMediaItem();
-                    player.prepare();
-                    player.play();
-                }
-            }
-        });
-        // continua de onde parou: a posição é guardada pelo endereço da página, não do vídeo
-        long resume = savedPosition(start);
-        resumed.add(start);
-        lastIndex = start;
-        player.seekTo(start, Math.max(0, resume));
-        if (resume > 0) toastResume(resume);
-        player.prepare();
-        player.play();
-        handler.postDelayed(saver, 5000);
+        }, Runnable::run);
     }
 
-    private static String keyOf(com.castor.mobile.MediaItem m) {
-        return m.pageUrl.isEmpty() ? m.url : m.pageUrl;
-    }
-
-    private long savedPosition(int index) {
-        if (index < 0 || index >= items.size()) return 0;
-        long[] saved = store.getPosition(keyOf(items.get(index)));
-        return saved == null ? 0 : Math.max(0, saved[0] - 2000); // volta 2 s para se situar
+    private static String keyOf(com.castor.mobile.MediaItem item) {
+        return item.pageUrl.isEmpty() ? item.url : item.pageUrl;
     }
 
     private void toastResume(long pos) {
@@ -216,21 +152,16 @@ public final class PlayerActivity extends AppCompatActivity {
         Toast.makeText(this, "Continuando de " + t, Toast.LENGTH_SHORT).show();
     }
 
-    /** Guarda a posição atual, desde que seja um vídeo longo, não ao vivo e que não tenha acabado. */
     private void saveCurrent() {
         if (player == null || items == null) return;
         int idx = player.getCurrentMediaItemIndex();
-        if (idx < 0 || idx >= items.size()) return;
-        if (player.isCurrentMediaItemLive()) return;
+        if (idx < 0 || idx >= items.size() || player.isCurrentMediaItemLive()) return;
         long dur = player.getDuration();
         long pos = player.getCurrentPosition();
         if (dur == androidx.media3.common.C.TIME_UNSET || dur < 60000) return;
         String key = keyOf(items.get(idx));
-        if (pos >= dur - 15000) {
-            store.clearPosition(key);
-        } else if (pos >= 5000) {
-            store.setPosition(key, pos, dur);
-        }
+        if (pos >= dur - 15000) store.clearPosition(key);
+        else if (pos >= 5000) store.setPosition(key, pos, dur);
     }
 
     private void hideSystemUi() {
@@ -244,9 +175,18 @@ public final class PlayerActivity extends AppCompatActivity {
     }
 
     @Override
-    public void onWindowFocusChanged(boolean hasFocus) {
-        super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) hideSystemUi();
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+            CastManager cm = CastManager.get(this);
+            if (cm.isActive() && event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP) {
+                if (cm.adjustVolume(1)) return true;
+                Toast.makeText(this, "Esta TV/servidor não permite controlar o volume por aqui", Toast.LENGTH_SHORT).show();
+            } else if (cm.isActive() && event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                if (cm.adjustVolume(-1)) return true;
+                Toast.makeText(this, "Esta TV/servidor não permite controlar o volume por aqui", Toast.LENGTH_SHORT).show();
+            }
+        }
+        return super.dispatchKeyEvent(event);
     }
 
     @Override
@@ -256,8 +196,7 @@ public final class PlayerActivity extends AppCompatActivity {
             try {
                 enterPictureInPictureMode(new PictureInPictureParams.Builder()
                         .setAspectRatio(new Rational(16, 9)).build());
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) { }
         }
     }
 
@@ -277,17 +216,19 @@ public final class PlayerActivity extends AppCompatActivity {
     protected void onStop() {
         super.onStop();
         saveCurrent();
-        if (player != null && !isInPictureInPictureMode()) player.pause();
+        // Não pausar nem liberar o player: o serviço continua reproduzindo com a tela apagada.
     }
 
     @Override
     protected void onDestroy() {
-        super.onDestroy();
-        handler.removeCallbacksAndMessages(null);
         saveCurrent();
-        if (player != null) {
-            player.release();
-            player = null;
+        if (player != null && playbackListener != null) player.removeListener(playbackListener);
+        if (playerView != null) playerView.setPlayer(null);
+        player = null;
+        if (controllerFuture != null) {
+            MediaController.releaseFuture(controllerFuture);
+            controllerFuture = null;
         }
+        super.onDestroy();
     }
 }

@@ -15,8 +15,16 @@ public final class CastDevice {
     public final String control;
     /** DLNA: tipo completo do serviço AVTransport. */
     public final String service;
+    /** DLNA: URL/serviço RenderingControl, quando a TV os anuncia. */
+    public final String renderingControl;
+    public final String renderingService;
 
     public CastDevice(int kind, String id, String name, String host, int port, String control, String service) {
+        this(kind, id, name, host, port, control, service, "", "");
+    }
+
+    public CastDevice(int kind, String id, String name, String host, int port, String control, String service,
+                      String renderingControl, String renderingService) {
         this.kind = kind;
         this.id = id;
         this.name = name == null || name.isEmpty() ? id : name;
@@ -24,6 +32,8 @@ public final class CastDevice {
         this.port = port;
         this.control = control == null ? "" : control;
         this.service = service == null ? "" : service;
+        this.renderingControl = renderingControl == null ? "" : renderingControl;
+        this.renderingService = renderingService == null ? "" : renderingService;
     }
 
     public String label() {

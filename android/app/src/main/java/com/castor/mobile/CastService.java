@@ -10,10 +10,14 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
+import android.net.wifi.WifiManager;
 
 /** Mantém o app vivo em segundo plano enquanto o proxy local entrega o vídeo para a TV. */
 public final class CastService extends Service {
     private static final String CHANNEL = "castor_cast";
+    private PowerManager.WakeLock cpuLock;
+    private WifiManager.WifiLock wifiLock;
 
     public static void start(Context c, String text) {
         Intent i = new Intent(c, CastService.class).putExtra("text", text);
@@ -32,7 +36,27 @@ public final class CastService extends Service {
     }
 
     @Override
+    public void onCreate() {
+        super.onCreate();
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null) {
+                cpuLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Castor:CastCpu");
+                cpuLock.setReferenceCounted(false);
+            }
+        } catch (Exception ignored) { }
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            if (wm != null) {
+                wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Castor:CastWifi");
+                wifiLock.setReferenceCounted(false);
+            }
+        } catch (Exception ignored) { }
+    }
+
+    @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        acquireLocks();
         String text = intent == null ? "" : intent.getStringExtra("text");
         NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= 26 && nm != null) {
@@ -58,6 +82,22 @@ public final class CastService extends Service {
         } catch (Exception ignored) {
         }
         return START_NOT_STICKY;
+    }
+
+    private void acquireLocks() {
+        try { if (cpuLock != null && !cpuLock.isHeld()) cpuLock.acquire(); } catch (Exception ignored) { }
+        try { if (wifiLock != null && !wifiLock.isHeld()) wifiLock.acquire(); } catch (Exception ignored) { }
+    }
+
+    private void releaseLocks() {
+        try { if (cpuLock != null && cpuLock.isHeld()) cpuLock.release(); } catch (Exception ignored) { }
+        try { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); } catch (Exception ignored) { }
+    }
+
+    @Override
+    public void onDestroy() {
+        releaseLocks();
+        super.onDestroy();
     }
 
     @Override

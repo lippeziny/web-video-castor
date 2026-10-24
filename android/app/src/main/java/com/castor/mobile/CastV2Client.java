@@ -53,6 +53,7 @@ public final class CastV2Client implements Closeable {
     private volatile long lastPos;
     private volatile long lastDur;
     private volatile long lastPosAt;
+    private volatile float receiverVolume = -1f;
 
     public CastV2Client(Listener l) {
         this.listener = l;
@@ -183,6 +184,24 @@ public final class CastV2Client implements Closeable {
         return lastDur;
     }
 
+    public float volumeLevel() { return receiverVolume; }
+
+    public void requestReceiverStatus() throws IOException {
+        send(NS_RECV, "receiver-0", "{\"type\":\"GET_STATUS\",\"requestId\":" + reqId.getAndIncrement() + "}");
+    }
+
+    public void setVolume(float level) throws Exception {
+        float clamped = Math.max(0f, Math.min(1f, level));
+        JSONObject volume = new JSONObject();
+        volume.put("level", clamped);
+        JSONObject msg = new JSONObject();
+        msg.put("type", "SET_VOLUME");
+        msg.put("volume", volume);
+        msg.put("requestId", reqId.getAndIncrement());
+        send(NS_RECV, "receiver-0", msg.toString());
+        receiverVolume = clamped;
+    }
+
     private void mediaCmd(String type, JSONObject extra) throws Exception {
         if (transportId == null || mediaSessionId < 0) throw new IOException("Nada está tocando no Chromecast");
         JSONObject m = extra == null ? new JSONObject() : extra;
@@ -263,6 +282,11 @@ public final class CastV2Client implements Closeable {
 
     private void onReceiverStatus(JSONObject status) {
         if (status == null) return;
+        JSONObject volume = status.optJSONObject("volume");
+        if (volume != null && volume.has("level")) {
+            double level = volume.optDouble("level", -1);
+            if (level >= 0 && level <= 1) receiverVolume = (float) level;
+        }
         JSONArray apps = status.optJSONArray("applications");
         if (apps == null) return;
         for (int i = 0; i < apps.length(); i++) {

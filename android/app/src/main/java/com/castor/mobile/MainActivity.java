@@ -6,8 +6,16 @@ import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.pm.ShortcutInfo;
+import android.content.pm.ShortcutManager;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.drawable.Icon;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
@@ -17,6 +25,7 @@ import android.net.NetworkInfo;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
@@ -24,6 +33,7 @@ import android.os.SystemClock;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
@@ -61,11 +71,14 @@ import org.json.JSONObject;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -83,13 +96,14 @@ public final class MainActivity extends Activity {
     private static final String HOME_URL = "file:///android_asset/home.html";
     private static final long DAY_MS = 24L * 60L * 60L * 1000L;
 
-    private static final int BG = Color.rgb(23, 25, 21);
-    private static final int PANEL = Color.rgb(36, 39, 32);
-    private static final int PANEL_LIGHT = Color.rgb(47, 51, 42);
-    private static final int TEXT = Color.rgb(255, 250, 242);
-    private static final int MUTED = Color.rgb(179, 180, 166);
-    private static final int PEACH = Color.rgb(242, 174, 134);
-    private static final int GREEN = Color.rgb(170, 205, 145);
+    private static int BG = Color.rgb(23, 25, 21);
+    private static int PANEL = Color.rgb(36, 39, 32);
+    private static int PANEL_LIGHT = Color.rgb(47, 51, 42);
+    private static int TEXT = Color.rgb(255, 250, 242);
+    private static int MUTED = Color.rgb(179, 180, 166);
+    private static int PEACH = Color.rgb(242, 174, 134);
+    private static int GREEN = Color.rgb(170, 205, 145);
+    private static final int REQUEST_CUSTOM_ICON_IMAGE = 8751;
 
     private static final int SCREEN_LIBRARY = 0;
     private static final int SCREEN_BROWSER = 1;
@@ -152,9 +166,21 @@ public final class MainActivity extends Activity {
         String allowOnce = "";
         String pendingUrl; // aba restaurada: só carrega quando for aberta
         final LinkedHashMap<String, MediaItem> videos = new LinkedHashMap<>();
+        boolean autoPlayScheduled;
+        boolean autoPlayLaunched;
 
         synchronized boolean addVideo(MediaItem m) {
-            if (videos.containsKey(m.url)) return false;
+            MediaItem old = videos.get(m.url);
+            if (old != null) {
+                String quality = m.quality.isEmpty() ? old.quality : m.quality;
+                String language = m.language.isEmpty() ? old.language : m.language;
+                String title = m.title.isEmpty() ? old.title : m.title;
+                if (quality.equals(old.quality) && language.equals(old.language) && title.equals(old.title)) return false;
+                videos.put(m.url, new MediaItem(m.url, title, m.referer.isEmpty() ? old.referer : m.referer,
+                        m.pageUrl.isEmpty() ? old.pageUrl : m.pageUrl, m.type.isEmpty() ? old.type : m.type,
+                        quality, language));
+                return true;
+            }
             if (videos.size() >= 120) {
                 String first = videos.keySet().iterator().next();
                 videos.remove(first);
@@ -175,7 +201,33 @@ public final class MainActivity extends Activity {
             videos.clear();
             blobSeen = false;
             blockedCount = 0;
+            autoPlayScheduled = false;
+            autoPlayLaunched = false;
         }
+    }
+
+    private void applyThemePalette() {
+        ThemePalette.apply(this);
+        BG = ThemePalette.BG;
+        PANEL = ThemePalette.PANEL;
+        PANEL_LIGHT = ThemePalette.PANEL_LIGHT;
+        TEXT = ThemePalette.TEXT;
+        MUTED = ThemePalette.MUTED;
+        PEACH = ThemePalette.ACCENT;
+        GREEN = ThemePalette.GREEN;
+        if (Build.VERSION.SDK_INT >= 21) {
+            getWindow().setStatusBarColor(BG);
+            getWindow().setNavigationBarColor(BG);
+        }
+        int flags = getWindow().getDecorView().getSystemUiVisibility();
+        if ("light".equals(store.theme())) {
+            flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            if (Build.VERSION.SDK_INT >= 26) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        } else {
+            flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            if (Build.VERSION.SDK_INT >= 26) flags &= ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+        getWindow().getDecorView().setSystemUiVisibility(flags);
     }
 
     // ------------------------------------------------------------------ ciclo de vida
@@ -184,6 +236,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         store = new Store(this);
+        applyThemePalette();
         castorJs = readAsset("castor.js");
         filters.loadCache(getApplicationContext());
         showBoot();
@@ -228,6 +281,21 @@ public final class MainActivity extends Activity {
         io.shutdownNow();
         for (Tab t : tabs) destroyWeb(t);
         tabs.clear();
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+            CastManager cm = CastManager.get(this);
+            if (cm.isActive() && event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP) {
+                if (cm.adjustVolume(1)) return true;
+                Toast.makeText(this, "Esta TV/servidor não permite controlar o volume por aqui", Toast.LENGTH_SHORT).show();
+            } else if (cm.isActive() && event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                if (cm.adjustVolume(-1)) return true;
+                Toast.makeText(this, "Esta TV/servidor não permite controlar o volume por aqui", Toast.LENGTH_SHORT).show();
+            }
+        }
+        return super.dispatchKeyEvent(event);
     }
 
     @Override
@@ -628,7 +696,7 @@ public final class MainActivity extends Activity {
         }
         ScrollView sv = new ScrollView(this);
         sv.addView(box);
-        AlertDialog.Builder b = new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK);
+        AlertDialog.Builder b = new AlertDialog.Builder(this, ThemePalette.dialogTheme(this));
         b.setTitle("Abas (" + tabs.size() + ")");
         b.setView(sv);
         b.setPositiveButton("Nova aba", (d, w) -> {
@@ -746,6 +814,7 @@ public final class MainActivity extends Activity {
                         + ";(document.head||document.documentElement).appendChild(s);";
                 view.evaluateJavascript("(function(){try{" + css + "}catch(e){}})();", null);
             }
+            if (isHome(url)) applyHomePageTheme(view);
             view.evaluateJavascript("window.__castorScan&&window.__castorScan(false)", null);
             if (!isHome(url)) store.addHistory(url, tab.title);
             saveTabs();
@@ -1079,15 +1148,80 @@ public final class MainActivity extends Activity {
     private void addVideo(Tab tab, String url) {
         String type = Ext.typeOf(url);
         if (type.isEmpty()) return;
-        addVideoForced(tab, url, type);
+        addVideoForced(tab, url, type, "", "");
     }
 
     private void addVideoForced(Tab tab, String url, String type) {
+        addVideoForced(tab, url, type, "", "");
+    }
+
+    private void addVideoForced(Tab tab, String url, String type, String quality, String language) {
         if (url == null || !url.startsWith("http")) return;
         if (store.ads() && filters.shouldBlock(url, FilterEngine.hostOfUrl(tab.url))) return;
         String page = TextUtils.isEmpty(tab.title) ? FilterEngine.hostOfUrl(tab.url) : tab.title;
-        MediaItem m = new MediaItem(url, page + " · " + fileName(url), tab.url, tab.url, type);
-        if (tab.addVideo(m)) ui.post(this::refreshBadge);
+        String q = TextUtils.isEmpty(quality) ? qualityFromUrl(url) : quality;
+        MediaItem m = new MediaItem(url, page + " · " + fileName(url), tab.url, tab.url, type, q, language);
+        if (tab.addVideo(m)) {
+            ui.post(() -> {
+                refreshBadge();
+                if (!"PÁGINA".equals(type) && !"ÁUDIO".equals(type)) scheduleAutoPlay(tab);
+            });
+        }
+    }
+
+    private String qualityFromUrl(String url) {
+        if (url == null) return "";
+        String u = url.toLowerCase(Locale.ROOT);
+        if (u.matches(".*(?:^|[^a-z0-9])(?:4k|2160p?)(?:[^a-z0-9]|$).*")) return "2160p (4K)";
+        if (u.matches(".*(?:^|[^a-z0-9])1440p?(?:[^a-z0-9]|$).*")) return "1440p (2K)";
+        Matcher m = Pattern.compile("(?:^|[^0-9])(1080|720|576|480|360|240)p?(?:[^0-9]|$)", Pattern.CASE_INSENSITIVE).matcher(u);
+        if (m.find()) return m.group(1) + "p";
+        return "";
+    }
+
+    private int qualityScore(MediaItem m) {
+        String q = m.quality + " " + m.url;
+        if (q.contains("2160") || q.toLowerCase(Locale.ROOT).contains("4k")) return 2160;
+        if (q.contains("1440")) return 1440;
+        if (q.contains("1080")) return 1080;
+        if (q.contains("720")) return 720;
+        if (q.contains("576")) return 576;
+        if (q.contains("480")) return 480;
+        if (q.contains("360")) return 360;
+        if (q.contains("240")) return 240;
+        return 0;
+    }
+
+    private void scheduleAutoPlay(Tab tab) {
+        if (!store.autoPlay()) return;
+        final String scheduledPage;
+        synchronized (tab) {
+            if (tab.autoPlayScheduled || tab.autoPlayLaunched) return;
+            tab.autoPlayScheduled = true;
+            scheduledPage = tab.url;
+        }
+        ui.postDelayed(() -> {
+            List<MediaItem> found;
+            synchronized (tab) {
+                tab.autoPlayScheduled = false;
+                if (tab.autoPlayLaunched || tab != cur()
+                        || !stripFragment(tab.url).equals(stripFragment(scheduledPage))) return;
+                found = tab.videoList();
+                tab.autoPlayLaunched = true;
+            }
+            MediaItem best = null;
+            for (MediaItem item : found) {
+                if ("PÁGINA".equals(item.type) || "ÁUDIO".equals(item.type)) continue;
+                if (best == null || qualityScore(item) > qualityScore(best)) best = item;
+            }
+            if (best != null) {
+                Toast.makeText(MainActivity.this, "Reprodução automática · "
+                        + (best.quality.isEmpty() ? "melhor fonte detectada" : best.quality), Toast.LENGTH_SHORT).show();
+                List<MediaItem> one = new ArrayList<>();
+                one.add(best);
+                play(one, 0);
+            }
+        }, 1800);
     }
 
     private void addFrame(Tab tab, String url) {
@@ -1130,6 +1264,21 @@ public final class MainActivity extends Activity {
                 for (int i = 0; i < a.length() && i < 200; i++) addVideo(tab, a.getString(i));
             } catch (JSONException ignored) {
             }
+        }
+
+        @JavascriptInterface
+        public void onMediaDetails(String json) {
+            try {
+                JSONArray a = new JSONArray(json);
+                for (int i = 0; i < a.length() && i < 200; i++) {
+                    JSONObject o = a.optJSONObject(i);
+                    if (o == null) continue;
+                    String url = o.optString("url", "");
+                    String type = Ext.typeOf(url);
+                    if (!type.isEmpty()) addVideoForced(tab, url, type,
+                            o.optString("quality", ""), o.optString("language", ""));
+                }
+            } catch (JSONException ignored) { }
         }
 
         @JavascriptInterface
@@ -1177,6 +1326,15 @@ public final class MainActivity extends Activity {
 
     private void play(List<MediaItem> list, int index) {
         if (list.isEmpty()) return;
+        Intent service = new Intent(this, PlaybackService.class)
+                .putExtra(PlayerActivity.EXTRA_ITEMS, Store.queueToJson(list))
+                .putExtra(PlayerActivity.EXTRA_INDEX, index);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(service);
+            else startService(service);
+        } catch (Exception e) {
+            Toast.makeText(this, "Não foi possível iniciar o serviço de mídia: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
         Intent i = new Intent(this, PlayerActivity.class);
         i.putExtra(PlayerActivity.EXTRA_ITEMS, Store.queueToJson(list));
         i.putExtra(PlayerActivity.EXTRA_INDEX, index);
@@ -1255,6 +1413,16 @@ public final class MainActivity extends Activity {
             line.addView(name, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
             card.addView(line);
 
+            if (!"PÁGINA".equals(m.type)) {
+                String details;
+                if ("ÁUDIO".equals(m.type)) details = "Áudio";
+                else details = m.quality.isEmpty() ? "Qualidade/resolução não informada pela fonte" : "Qualidade: " + m.quality;
+                if (!m.language.isEmpty()) details += " · " + m.language;
+                TextView meta = text(details, 11, GREEN, false);
+                meta.setPadding(0, dp(4), 0, 0);
+                card.addView(meta);
+            }
+
             TextView u = text(m.url, 11, MUTED, false);
             u.setMaxLines(2);
             u.setEllipsize(TextUtils.TruncateAt.MIDDLE);
@@ -1309,7 +1477,7 @@ public final class MainActivity extends Activity {
 
     private void showVideoMenu(final MediaItem m) {
         String[] items = {"Copiar link", "Compartilhar link", "Abrir em outro app", "Transmitir para a TV…"};
-        new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+        new AlertDialog.Builder(this, ThemePalette.dialogTheme(this))
                 .setTitle(m.type)
                 .setItems(items, (d, which) -> {
                     if (which == 0) {
@@ -1583,6 +1751,27 @@ public final class MainActivity extends Activity {
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(8), dp(20), dp(8));
 
+        box.addView(text("Aparência", 14, TEXT, true));
+        Button appearance = button("Tema atual: " + ThemePalette.label(store.theme()), PANEL_LIGHT, TEXT);
+        appearance.setOnClickListener(v -> showThemeDialog());
+        box.addView(appearance, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)));
+
+        box.addView(switchRow("Reproduzir automaticamente ao detectar vídeo", store.autoPlay(),
+                (b, on) -> store.setAutoPlay(on)));
+        Button quality = button("Qualidade preferida: " + qualityLabel(store.quality()), PANEL_LIGHT, TEXT);
+        quality.setOnClickListener(v -> showQualityDialog());
+        box.addView(quality, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)));
+        TextView qualityHint = text("Maior tenta usar a maior qualidade disponível; média limita a 720p e baixa a 480p em fontes adaptativas.", 11, MUTED, false);
+        qualityHint.setPadding(0, dp(3), 0, dp(8));
+        box.addView(qualityHint);
+
+        Button customIcon = button("Escolher imagem para ícone de atalho", PANEL_LIGHT, TEXT);
+        customIcon.setOnClickListener(v -> chooseCustomIconImage());
+        box.addView(customIcon, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)));
+        TextView iconHint = text("O Android permite criar um atalho com a imagem escolhida; o ícone original do pacote instalado não pode ser substituído dinamicamente em todos os launchers.", 11, MUTED, false);
+        iconHint.setPadding(0, dp(3), 0, dp(8));
+        box.addView(iconHint);
+
         box.addView(text("Tempo do aviso de bloqueio", 14, TEXT, true));
         final TextView secLabel = text(secondsText(store.noticeSeconds()), 13, MUTED, false);
         box.addView(secLabel);
@@ -1674,18 +1863,152 @@ public final class MainActivity extends Activity {
                 + "NAS ou Docker da mesma rede. O servidor converte o vídeo e queima legendas.", 11, MUTED, false);
         box.addView(remoteHint);
 
-        TextView about = text("Castor 2.1 · Detecta links diretos (MP4, HLS, DASH…). Não contorna DRM.", 11, MUTED, false);
+        TextView about = text("Castor 2.2 · Player em segundo plano, metadados de vídeo e cast nativo. Não contorna DRM.", 11, MUTED, false);
         about.setPadding(0, dp(16), 0, 0);
         box.addView(about);
 
         ScrollView sv = new ScrollView(this);
         sv.addView(box);
-        new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+        new AlertDialog.Builder(this, ThemePalette.dialogTheme(this))
                 .setTitle("Configurações")
                 .setView(sv)
                 .setPositiveButton("OK", (d, w) ->
                         store.setRemote(remoteUrl.getText().toString(), remoteToken.getText().toString()))
                 .show();
+    }
+
+    private String qualityLabel(String value) {
+        if ("medium".equals(value)) return "Média (até 720p)";
+        if ("low".equals(value)) return "Baixa (até 480p)";
+        return "Maior disponível";
+    }
+
+    private void showThemeDialog() {
+        String[] labels = {"Claro", "Escuro", "AMOLED (preto puro)"};
+        String[] values = {"light", "dark", "amoled"};
+        int selected = "light".equals(store.theme()) ? 0 : ("amoled".equals(store.theme()) ? 2 : 1);
+        new AlertDialog.Builder(this, ThemePalette.dialogTheme(this))
+                .setTitle("Aparência do Castor")
+                .setSingleChoiceItems(labels, selected, (dialog, which) -> {
+                    store.setTheme(values[which]);
+                    dialog.dismiss();
+                    recreate();
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private void showQualityDialog() {
+        String[] labels = {"Maior disponível (até 4K, conforme a fonte)", "Média (até 720p)", "Baixa (até 480p)"};
+        String[] values = {"high", "medium", "low"};
+        int selected = "medium".equals(store.quality()) ? 1 : ("low".equals(store.quality()) ? 2 : 0);
+        new AlertDialog.Builder(this, ThemePalette.dialogTheme(this))
+                .setTitle("Qualidade de reprodução")
+                .setSingleChoiceItems(labels, selected, (dialog, which) -> {
+                    store.setQuality(values[which]);
+                    dialog.dismiss();
+                    Toast.makeText(this, "Qualidade preferida: " + qualityLabel(store.quality()), Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Fechar", null)
+                .show();
+    }
+
+    private void chooseCustomIconImage() {
+        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        pick.addCategory(Intent.CATEGORY_OPENABLE);
+        pick.setType("image/*");
+        try {
+            startActivityForResult(pick, REQUEST_CUSTOM_ICON_IMAGE);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "Nenhum seletor de imagens disponível", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_CUSTOM_ICON_IMAGE || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+        try {
+            int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            if (Build.VERSION.SDK_INT >= 19 && (flags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                try { getContentResolver().takePersistableUriPermission(uri, flags); } catch (Exception ignored) { }
+            }
+            store.setCustomIconUri(uri.toString());
+            createPinnedShortcutWithImage(uri);
+        } catch (Exception e) {
+            Toast.makeText(this, "Não foi possível usar essa imagem: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void createPinnedShortcutWithImage(Uri uri) throws IOException {
+        if (Build.VERSION.SDK_INT < 26) {
+            Toast.makeText(this, "Atalho com ícone personalizado requer Android 8 ou superior", Toast.LENGTH_LONG).show();
+            return;
+        }
+        ShortcutManager sm = getSystemService(ShortcutManager.class);
+        if (sm == null || !sm.isRequestPinShortcutSupported()) {
+            Toast.makeText(this, "Seu launcher não permite fixar atalhos personalizados", Toast.LENGTH_LONG).show();
+            return;
+        }
+        Bitmap bitmap = loadSquareIcon(uri);
+        if (bitmap == null) throw new IOException("arquivo de imagem inválido");
+        Intent launch = new Intent(this, MainActivity.class)
+                .setAction(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        ShortcutInfo info = new ShortcutInfo.Builder(this, "castor-custom-icon")
+                .setShortLabel("Castor")
+                .setLongLabel("Castor · ícone personalizado")
+                .setIcon(Icon.createWithBitmap(bitmap))
+                .setIntent(launch)
+                .build();
+        boolean requested = sm.requestPinShortcut(info, null);
+        Toast.makeText(this, requested ? "Pedido para adicionar o atalho com sua imagem. Confirme na tela inicial." : "O launcher recusou o atalho personalizado.", Toast.LENGTH_LONG).show();
+    }
+
+    private Bitmap loadSquareIcon(Uri uri) throws IOException {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) return null;
+            BitmapFactory.decodeStream(in, null, bounds);
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+        int sample = 1;
+        while (bounds.outWidth / sample > 1024 || bounds.outHeight / sample > 1024) sample *= 2;
+        BitmapFactory.Options opts = new BitmapFactory.Options();
+        opts.inSampleSize = sample;
+        Bitmap source;
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) return null;
+            source = BitmapFactory.decodeStream(in, null, opts);
+        }
+        if (source == null) return null;
+        int side = Math.min(source.getWidth(), source.getHeight());
+        int left = (source.getWidth() - side) / 2;
+        int top = (source.getHeight() - side) / 2;
+        Bitmap square = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(square);
+        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        canvas.drawBitmap(source, new Rect(left, top, left + side, top + side), new Rect(0, 0, 512, 512), paint);
+        source.recycle();
+        return square;
+    }
+
+    private void applyHomePageTheme(WebView view) {
+        String bg = String.format(Locale.ROOT, "#%06X", (0xFFFFFF & BG));
+        String panel = String.format(Locale.ROOT, "#%06X", (0xFFFFFF & PANEL));
+        String text = String.format(Locale.ROOT, "#%06X", (0xFFFFFF & TEXT));
+        String muted = String.format(Locale.ROOT, "#%06X", (0xFFFFFF & MUTED));
+        String accent = String.format(Locale.ROOT, "#%06X", (0xFFFFFF & PEACH));
+        String css = "body{background:" + bg + "!important;color:" + text + "!important}"
+                + "p.sub,h2{color:" + muted + "!important}"
+                + "input,a.tile{background:" + panel + "!important;color:" + text + "!important;border-color:" + muted + "!important}"
+                + "a{color:" + accent + "!important}";
+        view.evaluateJavascript("(function(){var s=document.createElement('style');s.textContent="
+                + JSONObject.quote(css) + ";document.head.appendChild(s);document.documentElement.style.colorScheme='"
+                + ("light".equals(store.theme()) ? "light" : "dark") + "';})();", null);
     }
 
     private String secondsText(int s) {

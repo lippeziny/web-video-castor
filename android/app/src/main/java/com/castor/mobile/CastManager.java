@@ -66,6 +66,7 @@ public final class CastManager {
     private volatile String lastState = "";
     private volatile long lastPos;
     private volatile long lastDur;
+    private volatile float lastRequestedVolume = 0.5f;
     private int pollGen;
 
     private CastManager(Context c) {
@@ -402,6 +403,7 @@ public final class CastManager {
         c.connect(d.host, d.port > 0 ? d.port : 8009);
         cc = c;
         c.load(url, mimeOf(m, true), m.title, false, startMs / 1000.0);
+        try { c.requestReceiverStatus(); } catch (Exception ignored) { }
     }
 
     private void startDlna(CastDevice d, MediaItem m, String url, boolean hls, long startMs) throws Exception {
@@ -438,7 +440,17 @@ public final class CastManager {
                 return "video/webm";
             case "MKV":
                 return "video/x-matroska";
+            case "MOV":
+                return "video/quicktime";
+            case "FLV":
+                return "video/x-flv";
+            case "M4V":
+                return "video/x-m4v";
             case "ÁUDIO":
+                String u = m.url == null ? "" : m.url.toLowerCase(Locale.ROOT);
+                if (u.contains(".m4a")) return "audio/mp4";
+                if (u.contains(".ogg")) return "audio/ogg";
+                if (u.contains(".wav")) return "audio/wav";
                 return "audio/mpeg";
             default:
                 return "video/mp4";
@@ -555,6 +567,64 @@ public final class CastManager {
 
     public void seekBy(long deltaMs) {
         seekTo(lastPos + deltaMs);
+    }
+
+    public boolean supportsVolume() {
+        CastDevice d = active;
+        return d != null && (d.kind == CastDevice.CHROMECAST
+                || (d.kind == CastDevice.DLNA && !d.renderingControl.isEmpty()));
+    }
+
+    public float volumeLevel() {
+        CastDevice d = active;
+        if (d != null && d.kind == CastDevice.CHROMECAST && cc != null) {
+            float reported = cc.volumeLevel();
+            if (reported >= 0f) return reported;
+        }
+        return lastRequestedVolume;
+    }
+
+    /** Ajuste remoto; retorna false quando o dispositivo não oferece esse recurso. */
+    public boolean adjustVolume(final int direction) {
+        final CastDevice d = active;
+        if (d == null || d.kind == CastDevice.REMOTE
+                || (d.kind == CastDevice.DLNA && d.renderingControl.isEmpty())) return false;
+        exec.execute(() -> {
+            try {
+                if (d.kind == CastDevice.DLNA) {
+                    int current = DlnaClient.getVolume(d);
+                    int next = Math.max(0, Math.min(100, current + (direction < 0 ? -5 : 5)));
+                    DlnaClient.setVolume(d, next);
+                    lastRequestedVolume = next / 100f;
+                } else if (cc != null) {
+                    float current = cc.volumeLevel();
+                    if (current < 0f) current = lastRequestedVolume;
+                    float next = Math.max(0f, Math.min(1f, current + (direction < 0 ? -0.05f : 0.05f)));
+                    cc.setVolume(next);
+                    lastRequestedVolume = next;
+                }
+            } catch (Exception e) {
+                message("Não foi possível ajustar o volume da TV: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    public boolean setVolume(final float level) {
+        final CastDevice d = active;
+        final float value = Math.max(0f, Math.min(1f, level));
+        if (d == null || d.kind == CastDevice.REMOTE
+                || (d.kind == CastDevice.DLNA && d.renderingControl.isEmpty())) return false;
+        exec.execute(() -> {
+            try {
+                if (d.kind == CastDevice.DLNA) DlnaClient.setVolume(d, Math.round(value * 100f));
+                else if (cc != null) cc.setVolume(value);
+                lastRequestedVolume = value;
+            } catch (Exception e) {
+                message("Não foi possível ajustar o volume da TV: " + e.getMessage());
+            }
+        });
+        return true;
     }
 
     public void stop() {

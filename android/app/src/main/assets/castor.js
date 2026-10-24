@@ -6,6 +6,7 @@
   var URLRE = /https?:(?:\\?\/){2}[^\s"'<>\\)]+?\.(?:m3u8|mp4|mpd|webm|m4v|mov|mkv|flv)(?:\?[^\s"'<>\\)]*)?/gi;
   var seen = {};
   var seenFrames = {};
+  var metadataByUrl = {};
 
   function clean(u) {
     return u.replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
@@ -13,14 +14,46 @@
   function abs(u) {
     try { return new URL(u, document.baseURI).href; } catch (e) { return null; }
   }
-  function add(list, u) {
+  function add(list, u, meta) {
     if (!u || typeof u !== 'string') { return; }
     if (u.indexOf('blob:') === 0) { try { CastorBridge.onBlob(); } catch (e) {} return; }
     if (u.indexOf('data:') === 0) { return; }
     var a = abs(clean(u));
-    if (!a || !/^https?:/i.test(a) || seen[a]) { return; }
-    seen[a] = 1;
-    list.push(a);
+    if (!a || !/^https?:/i.test(a)) { return; }
+    if (!seen[a]) { seen[a] = 1; list.push(a); }
+    if (meta) {
+      var old = metadataByUrl[a] || {url:a, quality:'', language:''};
+      if (meta.quality) old.quality = meta.quality;
+      if (meta.language) old.language = meta.language;
+      old.url = a;
+      metadataByUrl[a] = old;
+    } else if (!metadataByUrl[a]) {
+      metadataByUrl[a] = {url:a, quality:'', language:''};
+    }
+  }
+
+  function metaForVideo(v) {
+    var w = Number(v.videoWidth || 0);
+    var h = Number(v.videoHeight || 0);
+    var q = '';
+    if (w > 0 && h > 0) {
+      var longSide = Math.max(w, h);
+      var p = longSide >= 3800 ? '4K' : (longSide >= 2500 ? '1440p' : (longSide >= 1900 ? '1080p' : (longSide >= 1200 ? '720p' : (longSide >= 850 ? '480p' : ''))));
+      q = w + '×' + h + (p ? ' (' + p + ')' : '');
+    }
+    var lang = '';
+    try {
+      if (v.audioTracks && v.audioTracks.length && v.audioTracks[0].language) {
+        lang = 'Áudio: ' + v.audioTracks[0].language;
+      }
+    } catch (e) {}
+    if (!lang) {
+      try {
+        var tracks = v.querySelectorAll('track[kind="captions"],track[kind="subtitles"]');
+        if (tracks.length && tracks[0].srclang) lang = 'Legenda: ' + tracks[0].srclang;
+      } catch (e) {}
+    }
+    return {quality:q, language:lang};
   }
 
   function scanDoc(doc, list, force) {
@@ -28,10 +61,11 @@
     els = doc.querySelectorAll('video,audio');
     for (i = 0; i < els.length; i++) {
       var v = els[i];
-      add(list, v.currentSrc); add(list, v.src);
-      add(list, v.getAttribute('data-src')); add(list, v.getAttribute('data-video-src'));
+      var vm = metaForVideo(v);
+      add(list, v.currentSrc, vm); add(list, v.src, vm);
+      add(list, v.getAttribute('data-src'), vm); add(list, v.getAttribute('data-video-src'), vm);
       var srcs = v.querySelectorAll('source');
-      for (j = 0; j < srcs.length; j++) { add(list, srcs[j].src); }
+      for (j = 0; j < srcs.length; j++) { add(list, srcs[j].src, vm); }
       if (force) {
         try {
           var wasPaused = v.paused;
@@ -78,10 +112,20 @@
         var pe = performance.getEntriesByType('resource');
         for (var i = 0; i < pe.length; i++) { if (EXT.test(pe[i].name)) { add(list, pe[i].name); } }
       } catch (e) {}
-      if (list.length) { CastorBridge.onMedia(JSON.stringify(list)); }
+      var allUrls = Object.keys(seen).slice(0, 200);
+      var details = [];
+      for (var k = 0; k < allUrls.length; k++) {
+        var u = allUrls[k];
+        var md = metadataByUrl[u] || {url:u, quality:'', language:''};
+        details.push({url:u, quality:md.quality || '', language:md.language || ''});
+      }
+      try {
+        if (CastorBridge.onMediaDetails) CastorBridge.onMediaDetails(JSON.stringify(details));
+        else if (list.length) CastorBridge.onMedia(JSON.stringify(list));
+      } catch (e) {}
       if (force) {
         if (frames.length) { CastorBridge.onFrames(JSON.stringify(frames)); }
-        setTimeout(function () { try { CastorBridge.onScanDone(list.length, frames.length); } catch (e) {} }, 1900);
+        setTimeout(function () { try { CastorBridge.onScanDone(allUrls.length, frames.length); } catch (e) {} }, 1900);
       }
     } catch (e) {}
   }

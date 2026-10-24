@@ -22,11 +22,20 @@ import java.util.Locale;
 
 /** Diálogos de transmissão: escolher a TV e controlar o que está tocando nela. */
 public final class CastUi {
-    private static final int PANEL_LIGHT = Color.rgb(47, 51, 42);
-    private static final int TEXT = Color.rgb(255, 250, 242);
-    private static final int MUTED = Color.rgb(179, 180, 166);
-    private static final int PEACH = Color.rgb(242, 174, 134);
-    private static final int BG = Color.rgb(23, 25, 21);
+    private static int PANEL_LIGHT = Color.rgb(47, 51, 42);
+    private static int TEXT = Color.rgb(255, 250, 242);
+    private static int MUTED = Color.rgb(179, 180, 166);
+    private static int PEACH = Color.rgb(242, 174, 134);
+    private static int BG = Color.rgb(23, 25, 21);
+
+    private static void applyPalette(Activity a) {
+        ThemePalette.apply(a);
+        PANEL_LIGHT = ThemePalette.PANEL_LIGHT;
+        TEXT = ThemePalette.TEXT;
+        MUTED = ThemePalette.MUTED;
+        PEACH = ThemePalette.ACCENT;
+        BG = ThemePalette.BG;
+    }
 
     private CastUi() {
     }
@@ -36,6 +45,7 @@ public final class CastUi {
      * Com {@code item == null} abre direto o controle da transmissão ativa.
      */
     public static void show(final Activity a, final MediaItem item, final long startMs) {
+        applyPalette(a);
         final CastManager cm = CastManager.get(a);
         if (item == null) {
             if (cm.isActive()) showControls(a);
@@ -65,7 +75,7 @@ public final class CastUi {
         ScrollView sv = new ScrollView(a);
         sv.addView(box);
         final AlertDialog[] dlg = new AlertDialog[1];
-        AlertDialog.Builder b = new AlertDialog.Builder(a, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+        AlertDialog.Builder b = new AlertDialog.Builder(a, ThemePalette.dialogTheme(a))
                 .setTitle("Transmitir para…")
                 .setView(sv)
                 .setPositiveButton("Buscar de novo", null)
@@ -122,7 +132,7 @@ public final class CastUi {
             et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
             et.setTextColor(TEXT);
             et.setHintTextColor(MUTED);
-            new AlertDialog.Builder(a, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+            new AlertDialog.Builder(a, ThemePalette.dialogTheme(a))
                     .setTitle("Adicionar por IP")
                     .setMessage("IP de um Chromecast, ou a URL de descrição de uma TV DLNA.")
                     .setView(et)
@@ -140,6 +150,7 @@ public final class CastUi {
     }
 
     public static void showControls(final Activity a) {
+        applyPalette(a);
         final CastManager cm = CastManager.get(a);
         LinearLayout box = new LinearLayout(a);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -180,6 +191,31 @@ public final class CastUi {
         rp.topMargin = dp(a, 8);
         box.addView(row, rp);
 
+        if (cm.supportsVolume()) {
+            TextView volumeLabel = text(a, "Volume da TV", 12, MUTED);
+            volumeLabel.setPadding(0, dp(a, 14), 0, dp(a, 2));
+            box.addView(volumeLabel);
+            SeekBar volumeBar = new SeekBar(a);
+            volumeBar.setMax(100);
+            volumeBar.setProgress(Math.round(cm.volumeLevel() * 100f));
+            box.addView(volumeBar);
+            volumeBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override public void onProgressChanged(SeekBar s, int progress, boolean fromUser) {
+                    if (fromUser) volumeLabel.setText("Volume da TV · " + progress + "%");
+                }
+                @Override public void onStartTrackingTouch(SeekBar s) { }
+                @Override public void onStopTrackingTouch(SeekBar s) {
+                    if (!cm.setVolume(s.getProgress() / 100f)) {
+                        Toast.makeText(a, "Este dispositivo não permite controlar o volume", Toast.LENGTH_LONG).show();
+                    }
+                }
+            });
+        } else {
+            TextView volumeHint = text(a, "Controle de volume indisponível neste dispositivo/servidor", 11, MUTED);
+            volumeHint.setPadding(0, dp(a, 12), 0, 0);
+            box.addView(volumeHint);
+        }
+
         final boolean[] dragging = new boolean[1];
         sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
@@ -199,7 +235,7 @@ public final class CastUi {
             }
         });
 
-        final AlertDialog dlg = new AlertDialog.Builder(a, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+        final AlertDialog dlg = new AlertDialog.Builder(a, ThemePalette.dialogTheme(a))
                 .setTitle("Controle da TV")
                 .setView(box)
                 .setPositiveButton("Fechar", null)
