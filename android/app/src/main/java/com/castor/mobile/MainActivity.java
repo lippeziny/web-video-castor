@@ -150,6 +150,7 @@ public final class MainActivity extends Activity {
         volatile boolean blobSeen;
         volatile int blockedCount;
         String allowOnce = "";
+        String pendingUrl; // aba restaurada: só carrega quando for aberta
         final LinkedHashMap<String, MediaItem> videos = new LinkedHashMap<>();
 
         synchronized boolean addVideo(MediaItem m) {
@@ -202,8 +203,15 @@ public final class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        saveTabs();
         Tab t = cur();
         if (t != null && t.web != null) t.web.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        saveTabs();
     }
 
     @Override
@@ -440,8 +448,36 @@ public final class MainActivity extends Activity {
         setContentView(outer);
 
         Uri data = getIntent() == null ? null : getIntent().getData();
-        newTab(data != null ? data.toString() : HOME_URL, true);
+        List<String[]> saved = store.savedTabs();
+        if (!saved.isEmpty()) {
+            for (String[] st : saved) restoreTab(st[0], st[1]);
+            switchToTab(Math.max(0, Math.min(store.savedTabsCurrent(), tabs.size() - 1)));
+            if (data != null) newTab(data.toString(), true);
+        } else {
+            newTab(data != null ? data.toString() : HOME_URL, true);
+        }
         showScreen(SCREEN_BROWSER);
+    }
+
+    /** Guarda as abas abertas para reabrir no mesmo estado depois. */
+    private void saveTabs() {
+        if (!browserShown || tabs.isEmpty() || store == null) return;
+        List<String[]> list = new ArrayList<>();
+        for (Tab t : tabs) {
+            String u = t.pendingUrl != null ? t.pendingUrl : t.url;
+            if (u == null || u.isEmpty()) u = HOME_URL;
+            list.add(new String[]{u, t.title == null ? "" : t.title});
+        }
+        store.saveTabs(list, Math.max(0, current));
+    }
+
+    private void restoreTab(String url, String title) {
+        Tab t = new Tab(); // WebView só é criado quando a aba for aberta (economiza memória)
+        t.url = url;
+        t.title = title == null ? "" : title;
+        t.pendingUrl = url;
+        tabs.add(t);
+        updateTabsCount();
     }
 
     private FrameLayout weightWrap(View v) {
@@ -486,6 +522,7 @@ public final class MainActivity extends Activity {
         t.lastTouch = SystemClock.uptimeMillis();
         t.web.loadUrl(normalize(url));
         updateTabsCount();
+        saveTabs();
     }
 
     private void switchToTab(int index) {
@@ -497,14 +534,22 @@ public final class MainActivity extends Activity {
         }
         current = index;
         Tab t = tabs.get(index);
+        if (t.web == null) t.web = createWebView(t);
         webHolder.addView(t.web, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         t.web.onResume();
+        if (t.pendingUrl != null) {
+            String pending = t.pendingUrl;
+            t.pendingUrl = null;
+            t.lastTouch = SystemClock.uptimeMillis();
+            t.web.loadUrl(normalize(pending));
+        }
         progressBar.setVisibility(View.INVISIBLE);
         updateAddress();
         refreshBadge();
         updateTabsCount();
         hideNotice();
+        saveTabs();
     }
 
     private void closeTab(int index) {
@@ -526,6 +571,7 @@ public final class MainActivity extends Activity {
             current--;
         }
         updateTabsCount();
+        saveTabs();
     }
 
     private void destroyWeb(Tab t) {
@@ -702,6 +748,7 @@ public final class MainActivity extends Activity {
             }
             view.evaluateJavascript("window.__castorScan&&window.__castorScan(false)", null);
             if (!isHome(url)) store.addHistory(url, tab.title);
+            saveTabs();
             if (tab == cur()) {
                 updateAddress();
                 progressBar.setVisibility(View.INVISIBLE);
@@ -1151,6 +1198,13 @@ public final class MainActivity extends Activity {
         Button force = button("Force search", PEACH, BG);
         force.setOnClickListener(v -> forceSearch());
         head.addView(force, new LinearLayout.LayoutParams(dp(130), dp(40)));
+        if (CastManager.get(this).isActive()) {
+            Button ctl = button("📺", PANEL_LIGHT, TEXT);
+            ctl.setOnClickListener(v -> CastUi.show(this, null, 0));
+            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(dp(48), dp(40));
+            cp.leftMargin = dp(8);
+            head.addView(ctl, cp);
+        }
         videosBox.addView(head);
 
         if (t != null && !t.url.isEmpty() && !isHome(t.url)) {
@@ -1236,6 +1290,9 @@ public final class MainActivity extends Activity {
                 });
                 actions.addView(queue, actionParams());
             }
+            Button castBtn = button("Cast", PANEL_LIGHT, TEXT);
+            castBtn.setOnClickListener(v -> CastUi.show(this, m, -1));
+            actions.addView(castBtn, actionParams());
             Button more = button("⋯", PANEL_LIGHT, TEXT);
             more.setOnClickListener(v -> showVideoMenu(m));
             actions.addView(more, new LinearLayout.LayoutParams(dp(48), dp(38)));
@@ -1251,7 +1308,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showVideoMenu(final MediaItem m) {
-        String[] items = {"Copiar link", "Compartilhar link", "Abrir em outro app"};
+        String[] items = {"Copiar link", "Compartilhar link", "Abrir em outro app", "Transmitir para a TV…"};
         new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
                 .setTitle(m.type)
                 .setItems(items, (d, which) -> {
@@ -1264,6 +1321,8 @@ public final class MainActivity extends Activity {
                         s.setType("text/plain");
                         s.putExtra(Intent.EXTRA_TEXT, m.url);
                         startActivity(Intent.createChooser(s, "Compartilhar"));
+                    } else if (which == 3) {
+                        CastUi.show(this, m, -1);
                     } else {
                         try {
                             Intent v = new Intent(Intent.ACTION_VIEW);
@@ -1583,7 +1642,39 @@ public final class MainActivity extends Activity {
         });
         box.addView(clearHist, clp);
 
-        TextView about = text("Castor 2.0 · Detecta links diretos (MP4, HLS, DASH…). Não contorna DRM.", 11, MUTED, false);
+        TextView castTitle = text("Transmissão (cast)", 14, TEXT, true);
+        castTitle.setPadding(0, dp(18), 0, dp(4));
+        box.addView(castTitle);
+        box.addView(switchRow("Usar proxy do app (recomendado)", store.castProxy(), (b, on) -> store.setCastProxy(on)));
+        TextView proxyHint = text("A TV não envia Referer nem cookies; o proxy do app faz isso por ela. "
+                + "Mantém o app ativo enquanto transmite.", 11, MUTED, false);
+        box.addView(proxyHint);
+        TextView remoteLabel = text("Servidor Castor remoto (api-server) — opcional", 13, TEXT, false);
+        remoteLabel.setPadding(0, dp(12), 0, dp(2));
+        box.addView(remoteLabel);
+        final EditText remoteUrl = new EditText(this);
+        remoteUrl.setHint("http://192.168.0.10:8411");
+        remoteUrl.setText(store.remoteUrl());
+        remoteUrl.setSingleLine(true);
+        remoteUrl.setTextSize(13);
+        remoteUrl.setTextColor(TEXT);
+        remoteUrl.setHintTextColor(MUTED);
+        remoteUrl.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        box.addView(remoteUrl);
+        final EditText remoteToken = new EditText(this);
+        remoteToken.setHint("Token (api.token)");
+        remoteToken.setText(store.remoteToken());
+        remoteToken.setSingleLine(true);
+        remoteToken.setTextSize(13);
+        remoteToken.setTextColor(TEXT);
+        remoteToken.setHintTextColor(MUTED);
+        remoteToken.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        box.addView(remoteToken);
+        TextView remoteHint = text("Rode “castor api-server”, “castor media-server” e “castor scraping-server” num PC, "
+                + "NAS ou Docker da mesma rede. O servidor converte o vídeo e queima legendas.", 11, MUTED, false);
+        box.addView(remoteHint);
+
+        TextView about = text("Castor 2.1 · Detecta links diretos (MP4, HLS, DASH…). Não contorna DRM.", 11, MUTED, false);
         about.setPadding(0, dp(16), 0, 0);
         box.addView(about);
 
@@ -1592,7 +1683,8 @@ public final class MainActivity extends Activity {
         new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
                 .setTitle("Configurações")
                 .setView(sv)
-                .setPositiveButton("OK", null)
+                .setPositiveButton("OK", (d, w) ->
+                        store.setRemote(remoteUrl.getText().toString(), remoteToken.getText().toString()))
                 .show();
     }
 

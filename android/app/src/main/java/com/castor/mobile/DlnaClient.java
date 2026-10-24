@@ -1,0 +1,258 @@
+package com.castor.mobile;
+
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.SocketTimeoutException;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Set;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+
+/** Descoberta (SSDP) e controle (UPnP AVTransport/SOAP) de TVs e players DLNA. */
+public final class DlnaClient {
+    private DlnaClient() {
+    }
+
+    // ---------------------------------------------------------------- descoberta
+
+    /** Procura renderizadores por {@code timeoutMs}; chama {@code cb} para cada novo dispositivo. Bloqueante. */
+    public static void search(int timeoutMs, Consumer<CastDevice> cb) {
+        Set<String> seen = new HashSet<>();
+        DatagramSocket sock = null;
+        try {
+            sock = new DatagramSocket();
+            sock.setSoTimeout(700);
+            InetAddress group = InetAddress.getByName("239.255.255.250");
+            String[] targets = {
+                    "urn:schemas-upnp-org:device:MediaRenderer:1",
+                    "urn:schemas-upnp-org:service:AVTransport:1"
+            };
+            long end = System.currentTimeMillis() + timeoutMs;
+            long nextSend = 0;
+            byte[] buf = new byte[4096];
+            while (System.currentTimeMillis() < end) {
+                if (System.currentTimeMillis() >= nextSend) {
+                    for (String st : targets) {
+                        String req = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                                + "MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: " + st + "\r\n\r\n";
+                        byte[] b = req.getBytes(StandardCharsets.US_ASCII);
+                        try {
+                            sock.send(new DatagramPacket(b, b.length, group, 1900));
+                        } catch (IOException ignored) {
+                        }
+                    }
+                    nextSend = System.currentTimeMillis() + 1800;
+                }
+                DatagramPacket p = new DatagramPacket(buf, buf.length);
+                try {
+                    sock.receive(p);
+                } catch (SocketTimeoutException t) {
+                    continue;
+                }
+                String resp = new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8);
+                String loc = header(resp, "location");
+                if (loc == null || !seen.add(loc)) continue;
+                try {
+                    CastDevice d = describe(loc);
+                    if (d != null) cb.accept(d);
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (sock != null) sock.close();
+        }
+    }
+
+    private static String header(String resp, String name) {
+        for (String line : resp.split("\r\n")) {
+            int c = line.indexOf(':');
+            if (c > 0 && line.substring(0, c).trim().equalsIgnoreCase(name)) return line.substring(c + 1).trim();
+        }
+        return null;
+    }
+
+    /** Lê o XML de descrição; devolve null se o aparelho não tiver AVTransport. */
+    public static CastDevice describe(String location) throws Exception {
+        byte[] xml = httpGet(location, 4000);
+        DocumentBuilderFactory f = DocumentBuilderFactory.newInstance();
+        try {
+            f.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        } catch (Exception ignored) {
+        }
+        DocumentBuilder b = f.newDocumentBuilder();
+        Document doc = b.parse(new ByteArrayInputStream(xml));
+        String name = text(doc.getElementsByTagName("friendlyName"));
+        String udn = text(doc.getElementsByTagName("UDN"));
+        NodeList services = doc.getElementsByTagName("service");
+        for (int i = 0; i < services.getLength(); i++) {
+            Element s = (Element) services.item(i);
+            String type = text(s.getElementsByTagName("serviceType"));
+            if (type != null && type.contains(":service:AVTransport:")) {
+                String ctl = text(s.getElementsByTagName("controlURL"));
+                if (ctl == null) continue;
+                URL base = new URL(location);
+                String abs = new URL(base, ctl).toString();
+                return new CastDevice(CastDevice.DLNA, "dlna:" + (udn != null ? udn : location),
+                        name, base.getHost(), base.getPort(), abs, type);
+            }
+        }
+        return null;
+    }
+
+    private static String text(NodeList l) {
+        if (l == null || l.getLength() == 0) return null;
+        String t = l.item(0).getTextContent();
+        return t == null ? null : t.trim();
+    }
+
+    static byte[] httpGet(String url, int timeout) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(timeout);
+        c.setReadTimeout(timeout);
+        try (InputStream in = c.getInputStream()) {
+            return readAll(in);
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    private static byte[] readAll(InputStream in) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[4096];
+        int n;
+        while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+        return bos.toByteArray();
+    }
+
+    // ---------------------------------------------------------------- controle
+
+    public static void setUri(CastDevice d, String url, String title, String mime) throws IOException {
+        String didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" "
+                + "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+                + "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
+                + "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>" + esc(title) + "</dc:title>"
+                + "<upnp:class>object.item.videoItem</upnp:class>"
+                + "<res protocolInfo=\"http-get:*:" + esc(mime) + ":*\">" + esc(url) + "</res></item></DIDL-Lite>";
+        soap(d, "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>" + esc(url)
+                + "</CurrentURI><CurrentURIMetaData>" + esc(didl) + "</CurrentURIMetaData>");
+    }
+
+    public static void play(CastDevice d) throws IOException {
+        soap(d, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>");
+    }
+
+    public static void pause(CastDevice d) throws IOException {
+        soap(d, "Pause", "<InstanceID>0</InstanceID>");
+    }
+
+    public static void stop(CastDevice d) throws IOException {
+        soap(d, "Stop", "<InstanceID>0</InstanceID>");
+    }
+
+    public static void seek(CastDevice d, long ms) throws IOException {
+        soap(d, "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>" + fmt(ms) + "</Target>");
+    }
+
+    /** @return {posição ms, duração ms} ou null. */
+    public static long[] position(CastDevice d) {
+        try {
+            String r = soap(d, "GetPositionInfo", "<InstanceID>0</InstanceID>");
+            long pos = parseTime(tag(r, "RelTime"));
+            long dur = parseTime(tag(r, "TrackDuration"));
+            return new long[]{pos, dur};
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** @return PLAYING, PAUSED_PLAYBACK, STOPPED, TRANSITIONING... ou "" */
+    public static String transportState(CastDevice d) {
+        try {
+            String r = soap(d, "GetTransportInfo", "<InstanceID>0</InstanceID>");
+            String s = tag(r, "CurrentTransportState");
+            return s == null ? "" : s;
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static String soap(CastDevice d, String action, String args) throws IOException {
+        String svc = d.service.isEmpty() ? "urn:schemas-upnp-org:service:AVTransport:1" : d.service;
+        String body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                + "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                + "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>"
+                + "<u:" + action + " xmlns:u=\"" + svc + "\">" + args + "</u:" + action + ">"
+                + "</s:Body></s:Envelope>";
+        byte[] data = body.getBytes(StandardCharsets.UTF_8);
+        HttpURLConnection c = (HttpURLConnection) new URL(d.control).openConnection();
+        c.setConnectTimeout(5000);
+        c.setReadTimeout(8000);
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
+        c.setRequestProperty("SOAPAction", "\"" + svc + "#" + action + "\"");
+        c.setFixedLengthStreamingMode(data.length);
+        try (OutputStream os = c.getOutputStream()) {
+            os.write(data);
+        }
+        int code = c.getResponseCode();
+        InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
+        String resp = is == null ? "" : new String(readAll(is), StandardCharsets.UTF_8);
+        c.disconnect();
+        if (code >= 400) {
+            String desc = tag(resp, "errorDescription");
+            throw new IOException("DLNA " + action + " falhou (" + code + ")" + (desc != null ? ": " + desc : ""));
+        }
+        return resp;
+    }
+
+    // ---------------------------------------------------------------- utilidades
+
+    private static String tag(String xml, String name) {
+        if (xml == null) return null;
+        Matcher m = Pattern.compile("<" + name + ">([^<]*)</" + name + ">").matcher(xml);
+        return m.find() ? m.group(1) : null;
+    }
+
+    public static String esc(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;").replace("'", "&apos;");
+    }
+
+    public static String fmt(long ms) {
+        long s = Math.max(0, ms) / 1000;
+        return String.format(Locale.ROOT, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+    }
+
+    static long parseTime(String t) {
+        if (t == null || t.isEmpty() || t.equalsIgnoreCase("NOT_IMPLEMENTED")) return 0;
+        try {
+            String[] p = t.split(":");
+            if (p.length < 3) return 0;
+            double sec = Double.parseDouble(p[2]);
+            return (Long.parseLong(p[0]) * 3600L + Long.parseLong(p[1]) * 60L) * 1000L + (long) (sec * 1000);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+}
