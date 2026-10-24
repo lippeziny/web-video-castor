@@ -224,6 +224,6 @@ Image tags: `latest` (stable), `canary` (preview), or a pinned `vX.Y.Z`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) to build or contribute. Castor provides no content, sources, or DRM circumvention. You are responsible for lawful use and compliance with site terms. Provided as-is for lawful, personal and educational use.
 
-## Android client
+## Android browser client
 
-An Android WebView client and a GitHub Actions workflow to produce a debug APK are included in [`android/`](android/) and [`ANDROID.md`](ANDROID.md). The APK uses the existing web UI; it does not replace the Castor backend or bundle Chromium/FFmpeg/Whisper.
+An Android browser build and a GitHub Actions workflow for a debug APK are included in [`android/`](android/) and [`ANDROID.md`](ANDROID.md). It bootstraps downloaded ad/tracker filters, blocks pop-ups/automatic redirects by default, and detects exposed direct media URLs. **This client does not yet embed and start the original Castor Go servers**: upstream scraping requires headless Chromium and media processing requires FFmpeg/FFprobe. See [`ANDROID.md`](ANDROID.md) for exact capabilities and limitations.
