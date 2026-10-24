@@ -79,6 +79,8 @@ public final class PlaybackService extends MediaSessionService {
 
         player = new ExoPlayer.Builder(this)
                 .setMediaSourceFactory(new DefaultMediaSourceFactory(perItem))
+                .setSeekBackIncrementMs(10_000)
+                .setSeekForwardIncrementMs(10_000)
                 .build();
         AudioAttributes mediaAudio = new AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)

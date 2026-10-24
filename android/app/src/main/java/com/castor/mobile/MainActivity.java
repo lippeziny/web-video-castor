@@ -1838,6 +1838,22 @@ public final class MainActivity extends Activity {
         TextView proxyHint = text("A TV não envia Referer nem cookies; o proxy do app faz isso por ela. "
                 + "Mantém o app ativo enquanto transmite.", 11, MUTED, false);
         box.addView(proxyHint);
+        Button batterySettings = button("Configurar bateria para tela apagada", PANEL_LIGHT, TEXT);
+        batterySettings.setOnClickListener(v -> {
+            try {
+                Intent settings = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName()));
+                startActivity(settings);
+            } catch (Exception e) {
+                Toast.makeText(this, "Abra as informações do Castor nas configurações do Android.", Toast.LENGTH_LONG).show();
+            }
+        });
+        box.addView(batterySettings, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)));
+        TextView batteryHint = text("Nas informações do app, abra Bateria e selecione “Sem restrições” (o nome pode variar). "
+                + "Isso ajuda a evitar que o Android suspenda a rede durante transmissões longas com a tela apagada.",
+                11, MUTED, false);
+        batteryHint.setPadding(0, dp(3), 0, dp(8));
+        box.addView(batteryHint);
         TextView remoteLabel = text("Servidor Castor remoto (api-server) — opcional", 13, TEXT, false);
         remoteLabel.setPadding(0, dp(12), 0, dp(2));
         box.addView(remoteLabel);
@@ -1863,7 +1879,7 @@ public final class MainActivity extends Activity {
                 + "NAS ou Docker da mesma rede. O servidor converte o vídeo e queima legendas.", 11, MUTED, false);
         box.addView(remoteHint);
 
-        TextView about = text("Castor 2.2 · Player em segundo plano, metadados de vídeo e cast nativo. Não contorna DRM.", 11, MUTED, false);
+        TextView about = text("Castor 2.2.1 · Player em segundo plano, metadados de vídeo e cast nativo. Não contorna DRM.", 11, MUTED, false);
         about.setPadding(0, dp(16), 0, 0);
         box.addView(about);
 

@@ -52,3 +52,10 @@ Requisitos do build: JDK 17, Gradle 8.13, Android SDK 36 (o workflow já configu
 - A descoberta de TVs não atravessa VLANs/sub-redes; celular e TV precisam estar na mesma rede.
 - Gera APK de depuração (sem assinatura de release).
 - Neste ambiente de edição não havia Android SDK nem Gradle disponíveis, e não foi possível baixá-los. Portanto, o APK não foi compilado aqui; execute o workflow do GitHub para validar o build. Também é necessário testar com uma TV real para confirmar os protocolos, o áudio e o volume suportados pelo seu modelo.
+
+### Tela apagada e comandos de busca
+
+A transmissão nativa mantém um serviço em primeiro plano com locks de CPU e Wi-Fi enquanto está ativa. Em aparelhos com economia de bateria agressiva, abra **Castor → Configurações → Transmissão (cast) → Configurar bateria para tela apagada** e defina o Castor como **Sem restrições** (os nomes variam por fabricante). O Android ainda pode impor Doze/restrições próprias; por isso, a continuidade por longos períodos depende também do fabricante e da rede.
+
+Os controles do player interno usam retroceder/avançar em intervalos de 10 segundos. No Chromecast, o aplicativo aguarda a identificação da sessão de mídia antes de enviar comandos de busca e tenta reconectar a sessão se o socket cair. O suporte de busca no DLNA depende de a TV aceitar `Seek` para o tipo de mídia em reprodução (algumas TVs não permitem buscar em streams ao vivo ou certos formatos).
+

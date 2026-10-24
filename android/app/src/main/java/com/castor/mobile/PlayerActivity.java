@@ -62,8 +62,12 @@ public final class PlayerActivity extends AppCompatActivity {
 
         playerView = new PlayerView(this);
         playerView.setBackgroundColor(Color.BLACK);
-        playerView.setShowNextButton(true);
-        playerView.setShowPreviousButton(true);
+        // Expor os comandos de navegação dentro do vídeo (±10 s), e não botões
+        // de faixa anterior/próxima, que ficam desativados em uma fila de um vídeo.
+        playerView.setShowRewindButton(true);
+        playerView.setShowFastForwardButton(true);
+        playerView.setShowNextButton(false);
+        playerView.setShowPreviousButton(false);
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         root.addView(playerView, new FrameLayout.LayoutParams(

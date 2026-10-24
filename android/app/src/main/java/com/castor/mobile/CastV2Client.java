@@ -154,9 +154,11 @@ public final class CastV2Client implements Closeable {
 
     public void seek(long ms) throws Exception {
         JSONObject extra = new JSONObject();
-        extra.put("currentTime", ms / 1000.0);
-        extra.put("resumeState", "PLAYBACK_START");
+        extra.put("currentTime", Math.max(0L, ms) / 1000.0);
+        // Não force a retomada se o usuário estiver assistindo com a reprodução pausada.
+        extra.put("resumeState", "PLAYBACK_UNCHANGED");
         mediaCmd("SEEK", extra);
+        requestStatus();
     }
 
     public void stopApp() {
@@ -203,7 +205,20 @@ public final class CastV2Client implements Closeable {
     }
 
     private void mediaCmd(String type, JSONObject extra) throws Exception {
-        if (transportId == null || mediaSessionId < 0) throw new IOException("Nada está tocando no Chromecast");
+        if (transportId == null) throw new IOException("O receptor do Chromecast ainda não está pronto");
+        if (mediaSessionId < 0) {
+            requestStatus();
+            long deadline = System.currentTimeMillis() + 4000L;
+            synchronized (lock) {
+                while (mediaSessionId < 0 && !closed) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) break;
+                    lock.wait(Math.min(remaining, 500L));
+                }
+            }
+        }
+        if (closed) throw new IOException("A conexão com o Chromecast foi encerrada");
+        if (mediaSessionId < 0) throw new IOException("O Chromecast ainda não confirmou a sessão de mídia; tente novamente em instantes");
         JSONObject m = extra == null ? new JSONObject() : extra;
         m.put("type", type);
         m.put("mediaSessionId", mediaSessionId);
@@ -307,6 +322,9 @@ public final class CastV2Client implements Closeable {
         JSONObject s = arr.optJSONObject(0);
         if (s == null) return;
         mediaSessionId = s.optInt("mediaSessionId", mediaSessionId);
+        synchronized (lock) {
+            lock.notifyAll();
+        }
         lastState = s.optString("playerState", lastState);
         lastPos = (long) (s.optDouble("currentTime", 0) * 1000);
         lastPosAt = System.currentTimeMillis();

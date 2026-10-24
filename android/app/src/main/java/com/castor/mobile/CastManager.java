@@ -66,7 +66,12 @@ public final class CastManager {
     private volatile String lastState = "";
     private volatile long lastPos;
     private volatile long lastDur;
+    private volatile long lastPosAt;
+    private volatile long ignoreDlnaPositionUntil;
     private volatile float lastRequestedVolume = 0.5f;
+    private volatile long castGeneration;
+    private volatile long connectionGeneration;
+    private volatile String activeStreamUrl = "";
     private int pollGen;
 
     private CastManager(Context c) {
@@ -321,20 +326,27 @@ public final class CastManager {
     public void cast(final CastDevice d, final MediaItem m, final long startMs) {
         message("Conectando a " + d.name + "…");
         exec.execute(() -> {
+            long generation = -1L;
+            String streamUrl = m.url;
             try {
                 stopInternal(false);
+                synchronized (this) {
+                    generation = ++castGeneration;
+                }
                 long start = startMs;
                 if (start < 0) {
                     long[] saved = store.getPosition(m.pageUrl.isEmpty() ? m.url : m.pageUrl);
                     start = saved == null ? 0 : Math.max(0, saved[0] - 2000);
                 }
                 activeItem = m;
+                active = d;
                 lastPos = start;
                 lastDur = 0;
+                lastPosAt = System.currentTimeMillis();
+                ignoreDlnaPositionUntil = 0L;
                 if (d.kind == CastDevice.REMOTE) {
                     boolean page = m.type.equals("PÁGINA");
                     RemoteCastor.cast(store.remoteUrl(), store.remoteToken(), d.control, m.url, page);
-                    active = d;
                     lastState = "PLAYING";
                     message("Enviado ao servidor Castor. A TV deve começar em instantes.");
                     notifyState();
@@ -343,41 +355,68 @@ public final class CastManager {
                 if (m.type.equals("PÁGINA")) {
                     message("Players embutidos só funcionam via servidor Castor. Abra o player e toque no vídeo.");
                     activeItem = null;
+                    active = null;
                     return;
                 }
-                String url = m.url;
+
+                // O serviço e os locks são necessários mesmo quando o proxy local foi desativado.
+                // Caso contrário, alguns Androids suspendem a CPU/Wi-Fi e derrubam a sessão com a tela apagada.
+                CastService.start(app, m.title);
+                streamUrl = m.url;
                 if (store.castProxy()) {
                     String ip = LocalProxy.lanIp();
                     if (ip != null) {
                         proxy.start();
                         proxy.setHost(ip);
-                        url = proxy.register(m.url, m.referer);
-                        CastService.start(app, m.title);
+                        streamUrl = proxy.register(m.url, m.referer);
                     } else {
                         message("Sem IP de Wi-Fi: enviando o link direto à TV.");
                     }
                 }
+                activeStreamUrl = streamUrl;
                 boolean hls = m.type.equals("HLS");
                 if (d.kind == CastDevice.CHROMECAST) {
-                    startChromecast(d, m, url, hls, start);
+                    startChromecast(d, m, streamUrl, hls, start, generation, 0);
                 } else {
-                    startDlna(d, m, url, hls, start);
+                    startDlna(d, m, streamUrl, hls, start);
+                    lastState = "PLAYING";
                 }
-                active = d;
                 startPolling();
                 notifyState();
             } catch (Exception e) {
-                active = null;
-                CastService.stop(app);
-                message("Falha ao transmitir: " + (e.getMessage() == null ? e.toString() : e.getMessage()));
+                if (d.kind == CastDevice.CHROMECAST && generation >= 0 && generation == castGeneration
+                        && activeItem == m) {
+                    message("A conexão inicial falhou; tentando reconectar ao Chromecast…");
+                    scheduleChromecastReconnect(d, m, streamUrl, m.type.equals("HLS"),
+                            Math.max(0L, lastPos), generation, 1);
+                    startPolling();
+                } else {
+                    active = null;
+                    activeItem = null;
+                    activeStreamUrl = "";
+                    CastService.stop(app);
+                    message("Falha ao transmitir: " + (e.getMessage() == null ? e.toString() : e.getMessage()));
+                }
             }
         });
     }
 
-    private void startChromecast(CastDevice d, MediaItem m, String url, boolean hls, long startMs) throws Exception {
+    private void startChromecast(CastDevice d, MediaItem m, String url, boolean hls,
+                                 long startMs, long generation, int reconnectAttempt) throws Exception {
+        final long connectionId;
+        synchronized (this) {
+            if (generation != castGeneration) return;
+            connectionId = ++connectionGeneration;
+        }
+        final CastV2Client[] clientHolder = new CastV2Client[1];
         CastV2Client c = new CastV2Client(new CastV2Client.Listener() {
+            private boolean isCurrent() {
+                return generation == castGeneration && connectionId == connectionGeneration;
+            }
+
             @Override
             public void onStatus(String state, long posMs, long durMs) {
+                if (!isCurrent()) return;
                 lastState = state;
                 lastPos = posMs;
                 lastDur = durMs;
@@ -386,24 +425,96 @@ public final class CastManager {
 
             @Override
             public void onError(String msg) {
-                message(msg);
+                if (isCurrent()) message(msg);
             }
 
             @Override
             public void onClosed() {
-                if (active != null && active.kind == CastDevice.CHROMECAST) {
-                    active = null;
-                    lastState = "";
-                    CastService.stop(app);
-                    message("A conexão com o Chromecast foi encerrada.");
-                    notifyState();
+                if (!isCurrent()) return;
+                // Não deixe o loop de acompanhamento usar o socket que acabou de cair.
+                if (cc == clientHolder[0]) cc = null;
+                scheduleChromecastReconnect(d, m, url, hls, Math.max(lastPos, startMs),
+                        generation, reconnectAttempt + 1);
+            }
+        });
+        clientHolder[0] = c;
+        cc = c;
+        try {
+            c.connect(d.host, d.port > 0 ? d.port : 8009);
+            c.load(url, mimeOf(m, true), m.title, false, Math.max(0L, startMs) / 1000.0);
+            // GET_STATUS da mídia fornece mediaSessionId; sem ele, SEEK/PAUSE/PLAY falham.
+            c.requestStatus();
+            try { c.requestReceiverStatus(); } catch (Exception ignored) { }
+            lastState = "BUFFERING";
+            notifyState();
+        } catch (Exception e) {
+            synchronized (this) {
+                if (connectionGeneration == connectionId) connectionGeneration++;
+            }
+            if (cc == c) cc = null;
+            c.close();
+            throw e;
+        }
+    }
+
+    private void scheduleChromecastReconnect(CastDevice d, MediaItem m, String oldUrl, boolean hls,
+                                            long startMs, long generation, int attempt) {
+        if (generation != castGeneration || activeItem != m || active != d) return;
+        if (attempt > 6) {
+            saveProgress();
+            synchronized (this) {
+                if (generation != castGeneration) return;
+                castGeneration++;
+                connectionGeneration++;
+                pollGen++;
+            }
+            CastV2Client previous = cc;
+            cc = null;
+            if (previous != null) previous.close();
+            active = null;
+            activeItem = null;
+            activeStreamUrl = "";
+            lastState = "";
+            proxy.stop();
+            CastService.stop(app);
+            message("Não consegui reconectar ao Chromecast. Confira o Wi-Fi e toque em Cast novamente.");
+            notifyState();
+            return;
+        }
+
+        lastState = "CONNECTING";
+        notifyState();
+        message("Conexão com a TV interrompida; reconectando (" + attempt + "/6)…");
+        exec.execute(() -> {
+            try {
+                Thread.sleep(Math.min(1000L + attempt * 1500L, 8000L));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (generation != castGeneration || activeItem != m || active != d) return;
+            String retryUrl = oldUrl;
+            try {
+                if (store.castProxy()) {
+                    String ip = LocalProxy.lanIp();
+                    if (ip != null) {
+                        proxy.start();
+                        proxy.setHost(ip);
+                        retryUrl = proxy.register(m.url, m.referer);
+                    }
+                }
+                // O serviço de primeiro plano já está ativo desde o início do cast.
+                activeStreamUrl = retryUrl;
+                startChromecast(d, m, retryUrl, hls, Math.max(0L, lastPos > 0 ? lastPos : startMs),
+                        generation, attempt);
+                notifyState();
+            } catch (Exception e) {
+                if (generation == castGeneration && activeItem == m && active == d) {
+                    scheduleChromecastReconnect(d, m, retryUrl, hls,
+                            Math.max(0L, lastPos > 0 ? lastPos : startMs), generation, attempt + 1);
                 }
             }
         });
-        c.connect(d.host, d.port > 0 ? d.port : 8009);
-        cc = c;
-        c.load(url, mimeOf(m, true), m.title, false, startMs / 1000.0);
-        try { c.requestReceiverStatus(); } catch (Exception ignored) { }
     }
 
     private void startDlna(CastDevice d, MediaItem m, String url, boolean hls, long startMs) throws Exception {
@@ -414,6 +525,7 @@ public final class CastManager {
         DlnaClient.setUri(d, url, m.title, mimeOf(m, false));
         DlnaClient.play(d);
         lastState = "PLAYING";
+        lastPosAt = System.currentTimeMillis();
         if (startMs > 3000) {
             // muitas TVs só aceitam o seek depois de começar a tocar
             for (int i = 0; i < 8; i++) {
@@ -475,13 +587,20 @@ public final class CastManager {
                 CastDevice d = active;
                 if (d == null || gen != pollGen) return;
                 if (d.kind == CastDevice.DLNA) {
-                    long[] p = DlnaClient.position(d);
-                    if (p != null) {
-                        lastPos = p[0];
-                        if (p[1] > 0) lastDur = p[1];
-                    }
                     String st = DlnaClient.transportState(d);
                     if (!st.isEmpty()) lastState = st.startsWith("PAUSED") ? "PAUSED" : st;
+                    long[] p = DlnaClient.position(d);
+                    long now = System.currentTimeMillis();
+                    if (p != null) {
+                        if (p[1] > 0) lastDur = p[1];
+                        // Algumas TVs retornam 00:00:00 quando não implementam GetPositionInfo.
+                        // Não zere a posição estimada nesse caso, senão cada toque em ±10s volta ao início.
+                        if (now >= ignoreDlnaPositionUntil
+                                && (p[0] > 0 || lastPos < 5000L || !lastState.startsWith("PLAY"))) {
+                            lastPos = p[0];
+                            lastPosAt = now;
+                        }
+                    }
                 } else if (d.kind == CastDevice.CHROMECAST) {
                     CastV2Client c = cc;
                     if (c != null) {
@@ -541,6 +660,7 @@ public final class CastManager {
                     return;
                 }
                 lastState = playing ? "PAUSED" : "PLAYING";
+                lastPosAt = System.currentTimeMillis();
                 notifyState();
             } catch (Exception e) {
                 message("Erro: " + e.getMessage());
@@ -553,11 +673,18 @@ public final class CastManager {
         if (d == null) return;
         exec.execute(() -> {
             try {
-                long target = Math.max(0, lastDur > 0 ? Math.min(ms, lastDur - 1000) : ms);
+                long duration = lastDur;
+                CastV2Client client = cc;
+                if (d.kind == CastDevice.CHROMECAST && client != null && client.duration() > 0) {
+                    duration = client.duration();
+                }
+                long target = Math.max(0L, duration > 0 ? Math.min(ms, Math.max(0L, duration - 1000L)) : ms);
                 if (d.kind == CastDevice.DLNA) DlnaClient.seek(d, target);
-                else if (d.kind == CastDevice.CHROMECAST && cc != null) cc.seek(target);
+                else if (d.kind == CastDevice.CHROMECAST && client != null) client.seek(target);
                 else return;
                 lastPos = target;
+                lastPosAt = System.currentTimeMillis();
+                if (d.kind == CastDevice.DLNA) ignoreDlnaPositionUntil = lastPosAt + 1800L;
                 notifyState();
             } catch (Exception e) {
                 message("Erro ao avançar: " + e.getMessage());
@@ -566,7 +693,18 @@ public final class CastManager {
     }
 
     public void seekBy(long deltaMs) {
-        seekTo(lastPos + deltaMs);
+        long base = lastPos;
+        CastDevice d = active;
+        CastV2Client client = cc;
+        if (d != null && d.kind == CastDevice.CHROMECAST && client != null) {
+            base = client.position();
+        } else if (d != null && d.kind == CastDevice.DLNA
+                && lastState.toUpperCase(Locale.ROOT).startsWith("PLAY") && lastPosAt > 0) {
+            // Estimativa para TVs DLNA que não devolvem posição atual confiável.
+            base += Math.max(0L, System.currentTimeMillis() - lastPosAt);
+            if (lastDur > 0) base = Math.min(base, lastDur);
+        }
+        seekTo(Math.max(0L, base + deltaMs));
     }
 
     public boolean supportsVolume() {
@@ -635,6 +773,8 @@ public final class CastManager {
         CastDevice d = active;
         synchronized (this) {
             pollGen++;
+            castGeneration++;
+            connectionGeneration++;
         }
         if (d != null) {
             saveProgress();
@@ -650,6 +790,8 @@ public final class CastManager {
             cc = null;
         }
         active = null;
+        activeItem = null;
+        activeStreamUrl = "";
         lastState = "";
         proxy.stop();
         CastService.stop(app);
@@ -660,6 +802,7 @@ public final class CastManager {
         String s = lastState == null ? "" : lastState.toUpperCase(Locale.ROOT);
         if (s.startsWith("PLAY")) return "Reproduzindo";
         if (s.startsWith("PAUS")) return "Pausado";
+        if (s.startsWith("CONNECT")) return "Reconectando…";
         if (s.equals("BUFFERING") || s.startsWith("TRANSITION")) return "Carregando…";
         if (s.equals("IDLE") || s.startsWith("STOP")) return "Parado";
         return s.isEmpty() ? "Conectando…" : s;

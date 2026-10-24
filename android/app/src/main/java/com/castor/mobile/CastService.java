@@ -56,7 +56,6 @@ public final class CastService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        acquireLocks();
         String text = intent == null ? "" : intent.getStringExtra("text");
         NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= 26 && nm != null) {
@@ -73,14 +72,21 @@ public final class CastService extends Service {
                 .setContentIntent(pi)
                 .setOngoing(true)
                 .build();
+        boolean foreground = false;
         try {
             if (Build.VERSION.SDK_INT >= 29) {
                 startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
             } else {
                 startForeground(7, n);
             }
+            foreground = true;
         } catch (Exception ignored) {
         }
+        if (foreground) {
+            acquireLocks();
+            return START_STICKY;
+        }
+        stopSelf(startId);
         return START_NOT_STICKY;
     }
 
