@@ -1,3 +1,7 @@
+# Castor Android
+
+Versão do app: **2.2.3**. Consulte `CHANGELOG-2.2.3.md` para as alterações e os testes executados.
+
 # Castor Android Browser 2.2
 
 Navegador Android (Java + WebView + Media3/ExoPlayer) com detecção de vídeos, fila de reprodução e bloqueio de anúncios, pop-ups e redirecionamentos.

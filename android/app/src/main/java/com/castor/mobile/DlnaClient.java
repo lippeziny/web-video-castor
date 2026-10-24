@@ -154,12 +154,22 @@ public final class DlnaClient {
     public static void setUri(CastDevice d, String url, String title, String mime) throws IOException {
         boolean audio = mime != null && mime.toLowerCase(Locale.ROOT).startsWith("audio/");
         String objectClass = audio ? "object.item.audioItem.musicTrack" : "object.item.videoItem";
+        // Advertise seek support for progressive files. HLS is a playlist stream and is not
+        // consistently seekable over generic DLNA renderers.
+        boolean progressive = mime != null && !mime.toLowerCase(Locale.ROOT).contains("mpegurl")
+                && !mime.toLowerCase(Locale.ROOT).contains("dash+xml");
+        // The proxy implements HTTP byte ranges, not TimeSeekRange.dlna.org, so advertise
+        // byte seek (OP=01) only. FLAGS includes byte-seek (0x20000000) and Interactive mode.
+        String dlnaOps = progressive
+                ? "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=21F00000000000000000000000000000"
+                : "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
         String didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" "
                 + "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
                 + "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
                 + "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>" + esc(title) + "</dc:title>"
                 + "<upnp:class>" + objectClass + "</upnp:class>"
-                + "<res protocolInfo=\"http-get:*:" + esc(mime) + ":*\">" + esc(url) + "</res></item></DIDL-Lite>";
+                + "<res protocolInfo=\"http-get:*:" + esc(mime) + ":" + dlnaOps + "\">"
+                + esc(url) + "</res></item></DIDL-Lite>";
         soap(d, "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>" + esc(url)
                 + "</CurrentURI><CurrentURIMetaData>" + esc(didl) + "</CurrentURIMetaData>");
     }
@@ -176,8 +186,135 @@ public final class DlnaClient {
         soap(d, "Stop", "<InstanceID>0</InstanceID>");
     }
 
+    /**
+     * Seek is implemented defensively for Samsung DLNA renderers. Some firmwares only publish
+     * Seek after the current transition completes or while paused, and reject a fractional time.
+     */
     public static void seek(CastDevice d, long ms) throws IOException {
-        soap(d, "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>" + fmt(ms) + "</Target>");
+        // A number of Samsung AVTransport implementations answer 701 when Seek is sent while
+        // PLAYING, even though they support it once the renderer is fully PAUSED_PLAYBACK.
+        // Start by settling the transport instead of knowingly issuing a request likely to fail.
+        String target = fmt(ms);
+        String initialState = transportState(d);
+        if (initialState.isEmpty()) initialState = "PLAYING"; // best-effort for older renderers
+        boolean wasPlaying = "PLAYING".equalsIgnoreCase(initialState)
+                || "TRANSITIONING".equalsIgnoreCase(initialState);
+        boolean pausedByUs = false;
+        IOException failures = new IOException("A TV recusou a busca para " + target);
+        String state = initialState;
+        try {
+            long transitionDeadline = System.currentTimeMillis() + 4500L;
+            while ("TRANSITIONING".equalsIgnoreCase(state)
+                    && System.currentTimeMillis() < transitionDeadline) {
+                sleepQuietly(180L);
+                state = transportState(d);
+            }
+
+            if ("PLAYING".equalsIgnoreCase(state)) {
+                try {
+                    pause(d);
+                    pausedByUs = true;
+                } catch (IOException pauseError) {
+                    failures.addSuppressed(pauseError);
+                }
+            }
+
+            // Samsung TVs can take more than one second to move to PAUSED_PLAYBACK. Re-issuing
+            // Pause is intentionally avoided unless the state remains PLAYING after the first wait.
+            long pausedDeadline = System.currentTimeMillis() + 4200L;
+            boolean pauseRetried = false;
+            while (System.currentTimeMillis() < pausedDeadline) {
+                state = transportState(d);
+                if ("PAUSED_PLAYBACK".equalsIgnoreCase(state) || "PAUSED".equalsIgnoreCase(state)) break;
+                if ("PLAYING".equalsIgnoreCase(state) && !pauseRetried) {
+                    try { pause(d); pausedByUs = true; } catch (IOException e) { failures.addSuppressed(e); }
+                    pauseRetried = true;
+                }
+                if (!"PLAYING".equalsIgnoreCase(state) && !"TRANSITIONING".equalsIgnoreCase(state)
+                        && !state.isEmpty() && !"PAUSED_PLAYBACK".equalsIgnoreCase(state)) break;
+                sleepQuietly(180L);
+            }
+
+            String actions = currentTransportActions(d);
+            IOException lastError = null;
+            String[] modes = {"REL_TIME", "ABS_TIME"};
+            for (String mode : modes) {
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    try {
+                        soap(d, "Seek", "<InstanceID>0</InstanceID><Unit>" + mode
+                                + "</Unit><Target>" + target + "</Target>");
+                        // A successful command can still take a short time to update GetPositionInfo.
+                        // CastManager suppresses stale poll values while it persists this target.
+                        return;
+                    } catch (IOException e) {
+                        lastError = e;
+                        failures.addSuppressed(e);
+                        if (!isTransitionUnavailable(e) && !isSeekModeUnsupported(e)) break;
+                        String nowState = transportState(d);
+                        if ("TRANSITIONING".equalsIgnoreCase(nowState)) {
+                            long deadline = System.currentTimeMillis() + 1700L;
+                            while ("TRANSITIONING".equalsIgnoreCase(nowState)
+                                    && System.currentTimeMillis() < deadline) {
+                                sleepQuietly(150L);
+                                nowState = transportState(d);
+                            }
+                        }
+                        // If a renderer resumed itself while processing the failed request, pause
+                        // it again before retrying. Some firmware only exposes Seek in paused state.
+                        if ("PLAYING".equalsIgnoreCase(nowState)) {
+                            try { pause(d); pausedByUs = true; } catch (IOException pauseError) { failures.addSuppressed(pauseError); }
+                            long deadline = System.currentTimeMillis() + 1400L;
+                            while (System.currentTimeMillis() < deadline) {
+                                nowState = transportState(d);
+                                if ("PAUSED_PLAYBACK".equalsIgnoreCase(nowState)
+                                        || "PAUSED".equalsIgnoreCase(nowState)) break;
+                                sleepQuietly(150L);
+                            }
+                        }
+                        if (attempt < 2) sleepQuietly(250L + attempt * 250L);
+                        // Do not repeat an invalid seek mode three times; give ABS_TIME a chance.
+                        if (isSeekModeUnsupported(e)) break;
+                    }
+                }
+            }
+            String finalState = transportState(d);
+            String detail = lastError == null ? "" : " Último erro: " + lastError.getMessage() + ".";
+            throw new IOException("A TV recusou a busca para " + target + ". Estado final: "
+                    + finalState + "; ações anunciadas: " + (actions.isEmpty() ? "não informadas" : actions)
+                    + "." + detail + " Se Seek não aparecer nas ações anunciadas mesmo pausada, "
+                    + "o firmware/recurso atual da TV não está oferecendo busca por DLNA.",
+                    lastError == null ? failures : lastError);
+        } finally {
+            if (pausedByUs && wasPlaying) {
+                try { play(d); } catch (IOException resumeError) { failures.addSuppressed(resumeError); }
+            }
+        }
+    }
+
+    private static void sleepQuietly(long ms) {
+        try { Thread.sleep(ms); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private static boolean isTransitionUnavailable(IOException e) {
+        String m = e == null || e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
+        return m.contains("701") || (m.contains("500") && m.contains("transition not available"))
+                || m.contains("transition not available") || m.contains("transição não disponível");
+    }
+
+    private static boolean isSeekModeUnsupported(IOException e) {
+        String m = e == null || e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
+        return m.contains("710") || m.contains("seek mode not supported") || m.contains("seek mode unsupported");
+    }
+
+    public static String currentTransportActions(CastDevice d) {
+        try {
+            String r = soap(d, "GetCurrentTransportActions", "<InstanceID>0</InstanceID>");
+            String actions = tag(r, "Actions");
+            return actions == null ? "" : actions.trim();
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     /** @return {posição ms, duração ms} ou null. */
@@ -251,8 +388,11 @@ public final class DlnaClient {
         String resp = is == null ? "" : new String(readAll(is), StandardCharsets.UTF_8);
         c.disconnect();
         if (code >= 400) {
+            String upnpCode = tag(resp, "errorCode");
             String desc = tag(resp, "errorDescription");
-            throw new IOException("DLNA " + action + " falhou (" + code + ")" + (desc != null ? ": " + desc : ""));
+            String fault = upnpCode == null ? "" : " [UPnP " + upnpCode + "]";
+            throw new IOException("DLNA " + action + " falhou (HTTP " + code + ")" + fault
+                    + (desc != null ? ": " + desc : ""));
         }
         return resp;
     }
@@ -261,8 +401,10 @@ public final class DlnaClient {
 
     private static String tag(String xml, String name) {
         if (xml == null) return null;
-        Matcher m = Pattern.compile("<" + name + ">([^<]*)</" + name + ">").matcher(xml);
-        return m.find() ? m.group(1) : null;
+        Pattern p = Pattern.compile("(?is)<(?:[A-Za-z0-9_-]+:)?" + Pattern.quote(name)
+                + "(?:\\s[^>]*)?>(.*?)</(?:[A-Za-z0-9_-]+:)?" + Pattern.quote(name) + "\\s*>");
+        Matcher m = p.matcher(xml);
+        return m.find() ? m.group(1).trim() : null;
     }
 
     public static String esc(String s) {
@@ -272,19 +414,21 @@ public final class DlnaClient {
     }
 
     public static String fmt(long ms) {
-        long s = Math.max(0, ms) / 1000;
-        return String.format(Locale.ROOT, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+        long totalSeconds = Math.max(0L, ms) / 1000L;
+        return String.format(Locale.ROOT, "%d:%02d:%02d",
+                totalSeconds / 3600L, (totalSeconds / 60L) % 60L, totalSeconds % 60L);
     }
 
+    /** Returns -1 when the TV reports NOT_IMPLEMENTED or an invalid time, not a fake 00:00:00. */
     static long parseTime(String t) {
-        if (t == null || t.isEmpty() || t.equalsIgnoreCase("NOT_IMPLEMENTED")) return 0;
+        if (t == null || t.trim().isEmpty() || t.trim().equalsIgnoreCase("NOT_IMPLEMENTED")) return -1L;
         try {
-            String[] p = t.split(":");
-            if (p.length < 3) return 0;
+            String[] p = t.trim().split(":");
+            if (p.length < 3) return -1L;
             double sec = Double.parseDouble(p[2]);
             return (Long.parseLong(p[0]) * 3600L + Long.parseLong(p[1]) * 60L) * 1000L + (long) (sec * 1000);
         } catch (Exception e) {
-            return 0;
+            return -1L;
         }
     }
 }

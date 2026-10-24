@@ -286,14 +286,10 @@ public final class MainActivity extends Activity {
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-            CastManager cm = CastManager.get(this);
-            if (cm.isActive() && event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP) {
-                if (cm.adjustVolume(1)) return true;
-                Toast.makeText(this, "Esta TV/servidor não permite controlar o volume por aqui", Toast.LENGTH_SHORT).show();
-            } else if (cm.isActive() && event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN) {
-                if (cm.adjustVolume(-1)) return true;
-                Toast.makeText(this, "Esta TV/servidor não permite controlar o volume por aqui", Toast.LENGTH_SHORT).show();
-            }
+            if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP
+                    && CastService.handleVolumeKey(this, 1)) return true;
+            if (event.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN
+                    && CastService.handleVolumeKey(this, -1)) return true;
         }
         return super.dispatchKeyEvent(event);
     }

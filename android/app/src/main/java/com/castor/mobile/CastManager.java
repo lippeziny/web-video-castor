@@ -45,6 +45,12 @@ public final class CastManager {
         t.setDaemon(true);
         return t;
     });
+    // A single command queue prevents rapid seek/volume/play commands from racing each other.
+    private final ExecutorService commandExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "castor-cast-commands");
+        t.setDaemon(true);
+        return t;
+    });
     private final LocalProxy proxy = new LocalProxy();
     private final CopyOnWriteArrayList<CastDevice> devices = new CopyOnWriteArrayList<>();
 
@@ -325,29 +331,43 @@ public final class CastManager {
      */
     public void cast(final CastDevice d, final MediaItem m, final long startMs) {
         message("Conectando a " + d.name + "…");
-        exec.execute(() -> {
+        commandExec.execute(() -> {
             long generation = -1L;
             String streamUrl = m.url;
             try {
+                // Casting is an exclusive playback target: pause the phone player before sending
+                // the stream to the TV. The TV decodes the stream itself; the phone becomes a remote.
+                PlaybackService.pauseForCast(app);
                 stopInternal(false);
                 synchronized (this) {
                     generation = ++castGeneration;
                 }
                 long start = startMs;
-                if (start < 0) {
+                long resumeDuration = 0L;
+                // A zero passed by a freshly reopened player is not an intentional restart if this
+                // page already has a saved checkpoint. Prefer the persisted position in that case.
+                if (start <= 5000L) {
                     long[] saved = store.getPosition(m.pageUrl.isEmpty() ? m.url : m.pageUrl);
-                    start = saved == null ? 0 : Math.max(0, saved[0] - 2000);
+                    // Older sessions may have stored the checkpoint against the direct media URL.
+                    if (saved == null && !m.pageUrl.isEmpty()) saved = store.getPosition(m.url);
+                    if (saved != null && saved[0] > 5000L) {
+                        start = Math.max(0L, saved[0] - 2000L);
+                        resumeDuration = Math.max(0L, saved[1]);
+                    } else if (start < 0L) {
+                        start = 0L;
+                    }
                 }
                 activeItem = m;
                 active = d;
                 lastPos = start;
-                lastDur = 0;
+                lastDur = resumeDuration;
                 lastPosAt = System.currentTimeMillis();
                 ignoreDlnaPositionUntil = 0L;
                 if (d.kind == CastDevice.REMOTE) {
                     boolean page = m.type.equals("PÁGINA");
                     RemoteCastor.cast(store.remoteUrl(), store.remoteToken(), d.control, m.url, page);
                     lastState = "PLAYING";
+                    CastService.start(app, m.title);
                     message("Enviado ao servidor Castor. A TV deve começar em instantes.");
                     notifyState();
                     return;
@@ -363,7 +383,10 @@ public final class CastManager {
                 // Caso contrário, alguns Androids suspendem a CPU/Wi-Fi e derrubam a sessão com a tela apagada.
                 CastService.start(app, m.title);
                 streamUrl = m.url;
-                if (store.castProxy()) {
+                // For DLNA always keep the byte-range proxy in the path: besides forwarding
+                // Referer/Cookies, it advertises Interactive transfer and preserves HTTP Range,
+                // which is required by many Samsung renderers to expose their Seek action.
+                if (store.castProxy() || d.kind == CastDevice.DLNA) {
                     String ip = LocalProxy.lanIp();
                     if (ip != null) {
                         proxy.start();
@@ -375,6 +398,7 @@ public final class CastManager {
                 }
                 activeStreamUrl = streamUrl;
                 boolean hls = m.type.equals("HLS");
+                if (lastPos >= 5000L) saveProgress();
                 if (d.kind == CastDevice.CHROMECAST) {
                     startChromecast(d, m, streamUrl, hls, start, generation, 0);
                 } else {
@@ -394,6 +418,7 @@ public final class CastManager {
                     active = null;
                     activeItem = null;
                     activeStreamUrl = "";
+                    proxy.stop();
                     CastService.stop(app);
                     message("Falha ao transmitir: " + (e.getMessage() == null ? e.toString() : e.getMessage()));
                 }
@@ -518,26 +543,45 @@ public final class CastManager {
     }
 
     private void startDlna(CastDevice d, MediaItem m, String url, boolean hls, long startMs) throws Exception {
-        try {
-            DlnaClient.stop(d);
-        } catch (Exception ignored) {
-        }
+        try { DlnaClient.stop(d); } catch (Exception ignored) { }
         DlnaClient.setUri(d, url, m.title, mimeOf(m, false));
         DlnaClient.play(d);
         lastState = "PLAYING";
         lastPosAt = System.currentTimeMillis();
-        if (startMs > 3000) {
-            // muitas TVs só aceitam o seek depois de começar a tocar
-            for (int i = 0; i < 8; i++) {
+        if (startMs > 3000L) {
+            // Wait for the TV's decoder to enter PLAYING before asking it to resume.
+            for (int i = 0; i < 10; i++) {
                 try {
-                    Thread.sleep(1200);
+                    Thread.sleep(600L);
                     String st = DlnaClient.transportState(d);
-                    if (st.equals("PLAYING") || i >= 5) {
-                        DlnaClient.seek(d, startMs);
-                        break;
-                    }
-                } catch (Exception ignored) {
+                    if ("PLAYING".equalsIgnoreCase(st)) break;
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (Exception ignored) { }
+            }
+            try {
+                DlnaClient.seek(d, startMs);
+                lastPos = startMs;
+                lastPosAt = System.currentTimeMillis();
+                ignoreDlnaPositionUntil = lastPosAt + 2200L;
+                String key = m.pageUrl.isEmpty() ? m.url : m.pageUrl;
+                store.setPosition(key, startMs, Math.max(0L, lastDur));
+            } catch (Exception e) {
+                // Never keep the requested resume timestamp as if the TV had jumped successfully.
+                // Otherwise every later checkpoint would overwrite the real position with a stale one.
+                long[] actual = DlnaClient.position(d);
+                if (actual != null && actual[0] > 0L) {
+                    lastPos = actual[0];
+                    if (actual[1] > 0L) lastDur = actual[1];
+                } else {
+                    lastPos = 0L;
                 }
+                lastPosAt = System.currentTimeMillis();
+                ignoreDlnaPositionUntil = 0L;
+                message("A TV recusou retomar de " + DlnaClient.fmt(startMs)
+                        + "; mantive o horário real informado pela TV para não salvar um ponto falso. Detalhe: "
+                        + e.getMessage());
             }
         }
     }
@@ -591,16 +635,33 @@ public final class CastManager {
                     if (!st.isEmpty()) lastState = st.startsWith("PAUSED") ? "PAUSED" : st;
                     long[] p = DlnaClient.position(d);
                     long now = System.currentTimeMillis();
+                    boolean playing = lastState.toUpperCase(Locale.ROOT).startsWith("PLAY");
                     if (p != null) {
                         if (p[1] > 0) lastDur = p[1];
-                        // Algumas TVs retornam 00:00:00 quando não implementam GetPositionInfo.
-                        // Não zere a posição estimada nesse caso, senão cada toque em ±10s volta ao início.
-                        if (now >= ignoreDlnaPositionUntil
-                                && (p[0] > 0 || lastPos < 5000L || !lastState.startsWith("PLAY"))) {
-                            lastPos = p[0];
-                            lastPosAt = now;
+                        if (now >= ignoreDlnaPositionUntil) {
+                            // Some Samsung TVs keep returning RelTime=00:00:00 even after playback
+                            // or a seek. Do not overwrite a valid non-zero checkpoint with this
+                            // stale zero; keep an estimated clock while playing and preserve it paused.
+                            if (p[0] > 0) {
+                                lastPos = p[0];
+                                lastPosAt = now;
+                            } else if (p[0] == 0 && lastPos <= 5000L) {
+                                lastPos = 0L;
+                                lastPosAt = now;
+                            } else if (playing) {
+                                if (lastPosAt > 0) lastPos += Math.max(0L, now - lastPosAt);
+                                lastPosAt = now;
+                            } else {
+                                // Reset the estimate anchor while paused, so a later resume does
+                                // not add the entire paused interval to the approximate position.
+                                lastPosAt = now;
+                            }
                         }
+                    } else if (playing) {
+                        if (lastPosAt > 0) lastPos += Math.max(0L, now - lastPosAt);
+                        lastPosAt = now;
                     }
+                    if (lastDur > 0) lastPos = Math.min(lastPos, lastDur);
                 } else if (d.kind == CastDevice.CHROMECAST) {
                     CastV2Client c = cc;
                     if (c != null) {
@@ -616,21 +677,37 @@ public final class CastManager {
         });
     }
 
+    /** Checkpoint usado pelo serviço persistente quando o app sai da tela ou o serviço é encerrado. */
+    public void checkpoint() {
+        commandExec.execute(this::saveProgress);
+    }
+
     private void saveProgress() {
         MediaItem m = activeItem;
-        if (m == null || lastDur < 60000) return;
+        if (m == null || m.type.equalsIgnoreCase("LIVE") || lastPos < 5000L) return;
         String key = m.pageUrl.isEmpty() ? m.url : m.pageUrl;
-        if (lastPos >= lastDur - 15000) store.clearPosition(key);
-        else if (lastPos >= 5000) store.setPosition(key, lastPos, lastDur);
+        // Some DLNA renderers don't report duration reliably. Persist position anyway; only clear
+        // the record when a known duration proves the item reached its end.
+        if (lastDur >= 60000L && lastPos >= lastDur - 15000L) {
+            store.clearPosition(key);
+            if (!m.url.equals(key)) store.clearPosition(m.url);
+        } else {
+            store.setPosition(key, lastPos, Math.max(0L, lastDur));
+            // Keep a direct-URL checkpoint too, so resume still works if the page URL changes.
+            if (!m.url.equals(key)) store.setPosition(m.url, lastPos, Math.max(0L, lastDur));
+        }
     }
 
     private void notifyState() {
         final StateListener l = stateListener;
-        if (l == null) return;
         final String s = lastState;
         final long p = lastPos;
         final long d = lastDur;
-        ui.post(() -> l.onState(s, p, d));
+        MediaItem item = activeItem;
+        CastDevice device = active;
+        CastService.updateCastState(app, item == null ? "" : item.title,
+                device == null ? "" : device.name, s, p, d);
+        if (l != null) ui.post(() -> l.onState(s, p, d));
     }
 
     private void message(final String text) {
@@ -644,9 +721,9 @@ public final class CastManager {
     // ---------------------------------------------------------------- controles
 
     public void togglePlayPause() {
-        final CastDevice d = active;
-        if (d == null) return;
-        exec.execute(() -> {
+        commandExec.execute(() -> {
+            final CastDevice d = active;
+            if (d == null) return;
             try {
                 boolean playing = !lastState.toUpperCase(Locale.ROOT).startsWith("PAUS");
                 if (d.kind == CastDevice.DLNA) {
@@ -669,42 +746,68 @@ public final class CastManager {
     }
 
     public void seekTo(final long ms) {
+        commandExec.execute(() -> performSeekTo(ms));
+    }
+
+    private void performSeekTo(long ms) {
         final CastDevice d = active;
         if (d == null) return;
-        exec.execute(() -> {
-            try {
-                long duration = lastDur;
-                CastV2Client client = cc;
-                if (d.kind == CastDevice.CHROMECAST && client != null && client.duration() > 0) {
-                    duration = client.duration();
-                }
-                long target = Math.max(0L, duration > 0 ? Math.min(ms, Math.max(0L, duration - 1000L)) : ms);
-                if (d.kind == CastDevice.DLNA) DlnaClient.seek(d, target);
-                else if (d.kind == CastDevice.CHROMECAST && client != null) client.seek(target);
-                else return;
-                lastPos = target;
-                lastPosAt = System.currentTimeMillis();
-                if (d.kind == CastDevice.DLNA) ignoreDlnaPositionUntil = lastPosAt + 1800L;
-                notifyState();
-            } catch (Exception e) {
-                message("Erro ao avançar: " + e.getMessage());
+        try {
+            long duration = lastDur;
+            CastV2Client client = cc;
+            if (d.kind == CastDevice.CHROMECAST && client != null && client.duration() > 0) {
+                duration = client.duration();
             }
-        });
+            long target = Math.max(0L, duration > 0 ? Math.min(ms, Math.max(0L, duration - 1000L)) : ms);
+            if (d.kind == CastDevice.DLNA) DlnaClient.seek(d, target);
+            else if (d.kind == CastDevice.CHROMECAST && client != null) client.seek(target);
+            else {
+                message("Este tipo de transmissão não permite buscar dentro do vídeo.");
+                return;
+            }
+            lastPos = target;
+            lastPosAt = System.currentTimeMillis();
+            if (d.kind == CastDevice.DLNA) ignoreDlnaPositionUntil = lastPosAt + 2200L;
+            MediaItem item = activeItem;
+            String key = item == null ? "" : (item.pageUrl.isEmpty() ? item.url : item.pageUrl);
+            if (!key.isEmpty()) {
+                if (target >= 5000L) {
+                    store.setPosition(key, target, Math.max(0L, duration));
+                    if (item != null && !item.url.equals(key)) store.setPosition(item.url, target, Math.max(0L, duration));
+                } else {
+                    // Seeking to the beginning invalidates the old resume point; otherwise a
+                    // previous 45-minute checkpoint would unexpectedly reappear after restart.
+                    store.clearPosition(key);
+                    if (item != null && !item.url.equals(key)) store.clearPosition(item.url);
+                }
+            }
+            notifyState();
+        } catch (Exception e) {
+            message("Erro ao avançar/retroceder: " + e.getMessage());
+        }
     }
 
     public void seekBy(long deltaMs) {
-        long base = lastPos;
-        CastDevice d = active;
-        CastV2Client client = cc;
-        if (d != null && d.kind == CastDevice.CHROMECAST && client != null) {
-            base = client.position();
-        } else if (d != null && d.kind == CastDevice.DLNA
-                && lastState.toUpperCase(Locale.ROOT).startsWith("PLAY") && lastPosAt > 0) {
-            // Estimativa para TVs DLNA que não devolvem posição atual confiável.
-            base += Math.max(0L, System.currentTimeMillis() - lastPosAt);
-            if (lastDur > 0) base = Math.min(base, lastDur);
-        }
-        seekTo(Math.max(0L, base + deltaMs));
+        // Resolve the base position inside the same command queue, so repeated 10-second taps
+        // accumulate instead of all using the same stale position.
+        commandExec.execute(() -> {
+            CastDevice d = active;
+            if (d == null) return;
+            long base = lastPos;
+            CastV2Client client = cc;
+            if (d.kind == CastDevice.CHROMECAST && client != null) {
+                long current = client.position();
+                if (current >= 0) base = current;
+            } else if (d.kind == CastDevice.DLNA) {
+                long now = System.currentTimeMillis();
+                if (lastState.toUpperCase(Locale.ROOT).startsWith("PLAY") && lastPosAt > 0) {
+                    base += Math.max(0L, now - lastPosAt);
+                }
+            }
+            long target = Math.max(0L, base + deltaMs);
+            if (lastDur > 0) target = Math.min(target, Math.max(0L, lastDur - 1000L));
+            performSeekTo(target);
+        });
     }
 
     public boolean supportsVolume() {
@@ -727,19 +830,21 @@ public final class CastManager {
         final CastDevice d = active;
         if (d == null || d.kind == CastDevice.REMOTE
                 || (d.kind == CastDevice.DLNA && d.renderingControl.isEmpty())) return false;
-        exec.execute(() -> {
+        commandExec.execute(() -> {
             try {
                 if (d.kind == CastDevice.DLNA) {
                     int current = DlnaClient.getVolume(d);
                     int next = Math.max(0, Math.min(100, current + (direction < 0 ? -5 : 5)));
                     DlnaClient.setVolume(d, next);
                     lastRequestedVolume = next / 100f;
+                    CastService.updateRemoteVolume(lastRequestedVolume);
                 } else if (cc != null) {
                     float current = cc.volumeLevel();
                     if (current < 0f) current = lastRequestedVolume;
                     float next = Math.max(0f, Math.min(1f, current + (direction < 0 ? -0.05f : 0.05f)));
                     cc.setVolume(next);
                     lastRequestedVolume = next;
+                    CastService.updateRemoteVolume(lastRequestedVolume);
                 }
             } catch (Exception e) {
                 message("Não foi possível ajustar o volume da TV: " + e.getMessage());
@@ -753,11 +858,12 @@ public final class CastManager {
         final float value = Math.max(0f, Math.min(1f, level));
         if (d == null || d.kind == CastDevice.REMOTE
                 || (d.kind == CastDevice.DLNA && d.renderingControl.isEmpty())) return false;
-        exec.execute(() -> {
+        commandExec.execute(() -> {
             try {
                 if (d.kind == CastDevice.DLNA) DlnaClient.setVolume(d, Math.round(value * 100f));
                 else if (cc != null) cc.setVolume(value);
                 lastRequestedVolume = value;
+                CastService.updateRemoteVolume(value);
             } catch (Exception e) {
                 message("Não foi possível ajustar o volume da TV: " + e.getMessage());
             }
@@ -766,7 +872,7 @@ public final class CastManager {
     }
 
     public void stop() {
-        exec.execute(() -> stopInternal(true));
+        commandExec.execute(() -> stopInternal(true));
     }
 
     private void stopInternal(boolean notify) {
@@ -793,6 +899,7 @@ public final class CastManager {
         activeItem = null;
         activeStreamUrl = "";
         lastState = "";
+        CastService.updateCastState(app, "", "", "", 0L, 0L);
         proxy.stop();
         CastService.stop(app);
         if (notify) notifyState();

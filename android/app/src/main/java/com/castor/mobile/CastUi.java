@@ -2,6 +2,9 @@ package com.castor.mobile;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.text.InputType;
@@ -46,6 +49,11 @@ public final class CastUi {
      */
     public static void show(final Activity a, final MediaItem item, final long startMs) {
         applyPalette(a);
+        // Ask at the moment the user starts a cast so Android can show the persistent TV control notification.
+        if (item != null && Build.VERSION.SDK_INT >= 33
+                && a.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            a.requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 8872);
+        }
         final CastManager cm = CastManager.get(a);
         if (item == null) {
             if (cm.isActive()) showControls(a);
@@ -154,7 +162,17 @@ public final class CastUi {
         final CastManager cm = CastManager.get(a);
         LinearLayout box = new LinearLayout(a);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(a, 20), dp(a, 8), dp(a, 20), dp(a, 8));
+        box.setPadding(dp(a, 20), dp(a, 16), dp(a, 20), dp(a, 12));
+        GradientDrawable glassPanel = new GradientDrawable();
+        glassPanel.setColor(0xF01C1D20);
+        glassPanel.setCornerRadius(dp(a, 28));
+        glassPanel.setStroke(dp(a, 1), 0x35FFFFFF);
+        box.setBackground(glassPanel);
+
+        TextView eyebrow = text(a, "CONTROLE DA TV", 10, PEACH);
+        eyebrow.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        eyebrow.setLetterSpacing(0.08f);
+        box.addView(eyebrow);
 
         MediaItem item = cm.activeItem();
         CastDevice dev = cm.activeDevice();
@@ -242,6 +260,18 @@ public final class CastUi {
                 .setNegativeButton("Parar transmissão", null)
                 .create();
         dlg.show();
+        android.view.Window window = dlg.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+            window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            window.setGravity(Gravity.BOTTOM);
+            android.view.WindowManager.LayoutParams attrs = window.getAttributes();
+            attrs.width = a.getResources().getDisplayMetrics().widthPixels - dp(a, 20);
+            attrs.y = dp(a, 14);
+            attrs.dimAmount = 0.58f;
+            attrs.flags |= android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND;
+            window.setAttributes(attrs);
+        }
         dlg.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
             cm.stop();
             dlg.dismiss();

@@ -10,8 +10,8 @@ android {
         applicationId = "com.castor.mobile"
         minSdk = 24
         targetSdk = 34
-        versionCode = 6
-        versionName = "2.2.1"
+        versionCode = 8
+        versionName = "2.2.3"
     }
 
     compileOptions {
@@ -42,4 +42,5 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-dash:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
     implementation("androidx.media3:media3-session:1.5.1")
+    implementation("androidx.media:media:1.7.0")
 }

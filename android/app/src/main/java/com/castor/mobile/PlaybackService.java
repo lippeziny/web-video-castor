@@ -28,10 +28,44 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /** Player persistente: mantém áudio, notificação e controles de mídia fora da Activity. */
 @OptIn(markerClass = UnstableApi.class)
 public final class PlaybackService extends MediaSessionService {
+    private static volatile PlaybackService instance;
+    private static volatile boolean localPlaying;
+    public static final String ACTION_PAUSE_FOR_CAST = "com.castor.mobile.player.PAUSE_FOR_CAST";
+
+    public static boolean isLocallyPlaying() { return localPlaying; }
+
+    /** Pause on the player's own application thread before switching playback to the TV. */
+    public static void pauseForCast(android.content.Context context) {
+        PlaybackService service = instance;
+        if (service == null) return;
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            service.saveCurrent();
+            if (service.player != null) service.player.pause();
+            localPlaying = false;
+            CastService.onLocalPlaybackChanged(service, false);
+            return;
+        }
+        CountDownLatch done = new CountDownLatch(1);
+        service.handler.post(() -> {
+            try {
+                service.saveCurrent();
+                if (service.player != null) service.player.pause();
+                localPlaying = false;
+                CastService.onLocalPlaybackChanged(service, false);
+            } finally {
+                done.countDown();
+            }
+        });
+        try { done.await(1500L, TimeUnit.MILLISECONDS); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
     private final Map<String, String> refererByUrl = new ConcurrentHashMap<>();
     private final List<com.castor.mobile.MediaItem> queueItems = new ArrayList<>();
     private final Set<Integer> resumedIndexes = new HashSet<>();
@@ -53,6 +87,8 @@ public final class PlaybackService extends MediaSessionService {
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
+        localPlaying = false;
         store = new Store(this);
         DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
                 .setAllowCrossProtocolRedirects(true)
@@ -117,9 +153,13 @@ public final class PlaybackService extends MediaSessionService {
             }
 
             @Override public void onIsPlayingChanged(boolean isPlaying) {
+                localPlaying = isPlaying;
                 handler.removeCallbacks(saver);
                 if (isPlaying) handler.postDelayed(saver, 5000);
                 else saveCurrent();
+                // When local audio starts, release TV ownership of the hardware volume keys.
+                // When it stops, CastService can retake them if no other app is audible.
+                CastService.onLocalPlaybackChanged(PlaybackService.this, isPlaying);
             }
 
             @Override public void onPlayerError(PlaybackException error) {
@@ -141,7 +181,14 @@ public final class PlaybackService extends MediaSessionService {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         super.onStartCommand(intent, flags, startId);
-        if (intent != null && intent.hasExtra(PlayerActivity.EXTRA_ITEMS)) loadQueue(intent);
+        if (intent != null && ACTION_PAUSE_FOR_CAST.equals(intent.getAction())) {
+            handler.post(() -> {
+                saveCurrent();
+                if (player != null) player.pause();
+            });
+        } else if (intent != null && intent.hasExtra(PlayerActivity.EXTRA_ITEMS)) {
+            loadQueue(intent);
+        }
         return START_STICKY;
     }
 
@@ -200,7 +247,9 @@ public final class PlaybackService extends MediaSessionService {
 
     private long savedPosition(int index) {
         if (index < 0 || index >= queueItems.size()) return 0;
-        long[] saved = store.getPosition(keyOf(queueItems.get(index)));
+        com.castor.mobile.MediaItem item = queueItems.get(index);
+        long[] saved = store.getPosition(keyOf(item));
+        if (saved == null && !item.pageUrl.isEmpty()) saved = store.getPosition(item.url);
         return saved == null ? 0 : Math.max(0, saved[0] - 2000);
     }
 
@@ -210,10 +259,18 @@ public final class PlaybackService extends MediaSessionService {
         if (idx < 0 || idx >= queueItems.size() || player.isCurrentMediaItemLive()) return;
         long dur = player.getDuration();
         long pos = player.getCurrentPosition();
-        if (dur == C.TIME_UNSET || dur < 60000) return;
+        // Some web streams report an unset duration for a while. Keep a valid position anyway;
+        // only use duration to clear the checkpoint when it is actually known.
+        if (dur != C.TIME_UNSET && dur > 0 && dur < 60000L) return;
         String key = keyOf(queueItems.get(idx));
-        if (pos >= dur - 15000) store.clearPosition(key);
-        else if (pos >= 5000) store.setPosition(key, pos, dur);
+        if (dur > 0 && dur != C.TIME_UNSET && pos >= dur - 15000L) {
+            store.clearPosition(key);
+            if (!queueItems.get(idx).url.equals(key)) store.clearPosition(queueItems.get(idx).url);
+        } else if (pos >= 5000L) {
+            long duration = dur == C.TIME_UNSET ? 0L : Math.max(0L, dur);
+            store.setPosition(key, pos, duration);
+            if (!queueItems.get(idx).url.equals(key)) store.setPosition(queueItems.get(idx).url, pos, duration);
+        }
     }
 
     @Override
@@ -228,6 +285,9 @@ public final class PlaybackService extends MediaSessionService {
             player.release();
         }
         player = null;
+        localPlaying = false;
+        if (instance == this) instance = null;
+        CastService.onLocalPlaybackChanged(this, false);
         super.onDestroy();
     }
 }

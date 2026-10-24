@@ -213,6 +213,9 @@ public final class LocalProxy {
             for (int i = 0; i < 6; i++) {
                 conn = (HttpURLConnection) new URL(target).openConnection();
                 conn.setInstanceFollowRedirects(false);
+                // Respect HEAD requests. Some TV renderers use HEAD to inspect seek/range support
+                // before deciding whether the DLNA Seek action is available.
+                conn.setRequestMethod("HEAD".equalsIgnoreCase(method) ? "HEAD" : "GET");
                 conn.setConnectTimeout(15000);
                 conn.setReadTimeout(25000);
                 conn.setRequestProperty("User-Agent", UA);
@@ -277,6 +280,18 @@ public final class LocalProxy {
             java.util.List<String[]> h = new java.util.ArrayList<>();
             h.add(new String[]{"Content-Type", ct});
             h.add(new String[]{"Accept-Ranges", "bytes"});
+            // On-demand video should be advertised as Interactive. Streaming is for one-way/live
+            // content and causes some Samsung renderers to omit Seek from AVTransport actions.
+            String ctypeLower = ct.toLowerCase(Locale.ROOT);
+            boolean progressiveMedia = ctypeLower.startsWith("video/")
+                    && !ctypeLower.contains("mpegurl") && !ctypeLower.contains("dash+xml");
+            h.add(new String[]{"transferMode.dlna.org", progressiveMedia ? "Interactive" : "Streaming"});
+            // DLNA renderers often hide/disable Seek unless byte/time seeking is advertised.
+            // The proxy forwards Range requests to the origin and relays 206 + Content-Range.
+            if (progressiveMedia) {
+                h.add(new String[]{"contentFeatures.dlna.org",
+                        "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=21F00000000000000000000000000000"});
+            }
             if (len != null) h.add(new String[]{"Content-Length", len});
             if (cr != null) h.add(new String[]{"Content-Range", cr});
             writeHead(out, code, code == 206 ? "Partial Content" : "OK", h.toArray(new String[0][]));

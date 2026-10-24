@@ -153,11 +153,15 @@ public final class CastV2Client implements Closeable {
     }
 
     public void seek(long ms) throws Exception {
+        long target = Math.max(0L, ms);
         JSONObject extra = new JSONObject();
-        extra.put("currentTime", Math.max(0L, ms) / 1000.0);
+        extra.put("currentTime", target / 1000.0);
         // Não force a retomada se o usuário estiver assistindo com a reprodução pausada.
         extra.put("resumeState", "PLAYBACK_UNCHANGED");
         mediaCmd("SEEK", extra);
+        // Update locally before the receiver's asynchronous GET_STATUS can arrive.
+        lastPos = target;
+        lastPosAt = System.currentTimeMillis();
         requestStatus();
     }
 
@@ -326,7 +330,15 @@ public final class CastV2Client implements Closeable {
             lock.notifyAll();
         }
         lastState = s.optString("playerState", lastState);
-        lastPos = (long) (s.optDouble("currentTime", 0) * 1000);
+        if (s.has("currentTime")) {
+            long reportedPos = (long) (s.optDouble("currentTime", 0) * 1000);
+            // Status messages from a receiver can briefly report 0 during transitions. Preserve
+            // a valid position unless the client itself explicitly sought to the beginning.
+            if (reportedPos > 0L || lastPos <= 5000L
+                    || "IDLE".equalsIgnoreCase(lastState) || "FINISHED".equalsIgnoreCase(lastState)) {
+                lastPos = reportedPos;
+            }
+        }
         lastPosAt = System.currentTimeMillis();
         JSONObject media = s.optJSONObject("media");
         if (media != null && media.has("duration")) lastDur = (long) (media.optDouble("duration", 0) * 1000);
