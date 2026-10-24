@@ -1,0 +1,26 @@
+! Castor Android built-in fallback rules. Downloaded EasyList/EasyPrivacy rules are added on first launch.
+||doubleclick.net^
+||googlesyndication.com^
+||googleadservices.com^
+||adservice.google.com^
+||adnxs.com^
+||adsrvr.org^
+||taboola.com^
+||outbrain.com^
+||popads.net^
+||popcash.net^
+||propellerads.com^
+||exoclick.com^
+||adsterra.com^
+||zedo.com^
+||quantserve.com^
+||scorecardresearch.com^
+||criteo.com^
+||criteo.net^
+||amazon-adsystem.com^
+||adroll.com^
+||rubiconproject.com^
+||pubmatic.com^
+||openx.net^
+||smartadserver.com^
+||hotjar.com^

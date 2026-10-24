@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Castor</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #171915; color: #fffaf2; font-family: sans-serif; padding: 28px 18px 40px; }
+  h1 { font-size: 26px; margin: 8px 0 4px; text-align: center; }
+  p.sub { margin: 0 0 22px; text-align: center; color: #b3b4a6; font-size: 14px; }
+  form { margin-bottom: 26px; }
+  input { width: 100%; box-sizing: border-box; padding: 14px 18px; border-radius: 26px; border: 1px solid #3a3e33;
+          background: #242720; color: #fffaf2; font-size: 16px; outline: none; }
+  h2 { font-size: 14px; letter-spacing: .08em; text-transform: uppercase; color: #b3b4a6; margin: 0 0 12px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  a.tile { display: flex; flex-direction: column; align-items: center; gap: 8px; text-decoration: none; color: #fffaf2;
+           background: #242720; border-radius: 16px; padding: 16px 6px; font-size: 13px; }
+  .dot { width: 44px; height: 44px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+         font-weight: bold; font-size: 20px; color: #171915; }
+</style>
+</head>
+<body>
+  <h1>Castor</h1>
+  <p class="sub">Navegue, encontre vídeos e monte sua fila.</p>
+  <form onsubmit="go(event)"><input id="q" type="text" placeholder="Pesquisar ou digitar endereço" autocomplete="off"></form>
+  <h2>Serviços</h2>
+  <div class="grid">
+    <a class="tile" href="https://www.google.com/"><span class="dot" style="background:#8ab4f8">G</span>Google</a>
+    <a class="tile" href="https://www.youtube.com/"><span class="dot" style="background:#ff6b6b">Y</span>YouTube</a>
+    <a class="tile" href="https://www.primevideo.com/"><span class="dot" style="background:#6cc4ff">P</span>Prime Video</a>
+    <a class="tile" href="https://www.netflix.com/"><span class="dot" style="background:#ff8a80">N</span>Netflix</a>
+    <a class="tile" href="https://vimeo.com/"><span class="dot" style="background:#7fd6e8">V</span>Vimeo</a>
+    <a class="tile" href="https://www.dailymotion.com/"><span class="dot" style="background:#a8c7ff">D</span>Dailymotion</a>
+    <a class="tile" href="https://www.twitch.tv/"><span class="dot" style="background:#c9a7ff">T</span>Twitch</a>
+    <a class="tile" href="https://globoplay.globo.com/"><span class="dot" style="background:#f2ae86">G</span>Globoplay</a>
+    <a class="tile" href="https://archive.org/details/movies"><span class="dot" style="background:#aacd91">A</span>Archive</a>
+  </div>
+<script>
+function go(e) {
+  e.preventDefault();
+  var v = document.getElementById('q').value.trim();
+  if (!v) return;
+  var u;
+  if (/^https?:\/\//i.test(v)) u = v;
+  else if (/^[^\s]+\.[a-z]{2,}(\/.*)?$/i.test(v)) u = 'https://' + v;
+  else u = 'https://www.google.com/search?q=' + encodeURIComponent(v);
+  location.href = u;
+}
+</script>
+</body>
+</html>

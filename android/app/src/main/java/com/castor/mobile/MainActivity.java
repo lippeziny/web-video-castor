@@ -2,48 +2,53 @@ package com.castor.mobile;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
-import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
 import android.net.http.SslError;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Message;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.view.Gravity;
-import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.Window;
-import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
-import android.webkit.HttpAuthHandler;
+import android.view.inputmethod.InputMethodManager;
+import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.PermissionRequest;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.PopupWindow;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -51,36 +56,32 @@ import android.widget.Toast;
 
 import org.json.JSONArray;
 import org.json.JSONException;
+import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Native browser wrapper for Castor concepts with automatic local browser setup. */
+/**
+ * Castor Browser: navegador com detecção de vídeos, fila de reprodução e bloqueio de anúncios,
+ * pop-ups e redirecionamentos. Interface baseada no desenho do usuário.
+ */
 public final class MainActivity extends Activity {
-    private static final String PREFS = "castor_mobile_preferences";
-    private static final String KEY_FILTER_REFRESH = "filter_refresh_at";
-    private static final String KEY_ADBLOCK = "ad_block_enabled";
-    private static final String KEY_REDIRECT_BLOCK = "redirect_block_enabled";
-    private static final String KEY_POPUP_BLOCK = "popup_block_enabled";
-    private static final String KEY_PROMPT_SECONDS = "blocked_prompt_seconds";
-    private static final String KEY_FIRST_BOOT = "first_boot_finished";
-    private static final long FILTER_REFRESH_MS = 24L * 60L * 60L * 1000L;
-    private static final int FILTER_MAX_BYTES = 1_500_000;
+    public static final String USER_AGENT_MOBILE =
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    + "Chrome/124.0.0.0 Mobile Safari/537.36";
+    private static final String USER_AGENT_DESKTOP =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    + "Chrome/124.0.0.0 Safari/537.36";
+    private static final String HOME_URL = "file:///android_asset/home.html";
+    private static final long DAY_MS = 24L * 60L * 60L * 1000L;
 
     private static final int BG = Color.rgb(23, 25, 21);
     private static final int PANEL = Color.rgb(36, 39, 32);
@@ -90,945 +91,1629 @@ public final class MainActivity extends Activity {
     private static final int PEACH = Color.rgb(242, 174, 134);
     private static final int GREEN = Color.rgb(170, 205, 145);
 
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService bootstrapExecutor = Executors.newSingleThreadExecutor();
-    private final FilterEngine filterEngine = new FilterEngine();
-    private final Map<String, VideoItem> foundVideos = new LinkedHashMap<>();
+    private static final int SCREEN_LIBRARY = 0;
+    private static final int SCREEN_BROWSER = 1;
+    private static final int SCREEN_VIDEOS = 2;
 
-    private SharedPreferences preferences;
-    private LinearLayout bootRoot;
-    private TextView bootTitle;
-    private TextView bootSubtitle;
-    private ProgressBar bootProgress;
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final ExecutorService io = Executors.newCachedThreadPool();
+    private final FilterEngine filters = new FilterEngine();
+    private final List<Tab> tabs = new ArrayList<>();
 
-    private LinearLayout rootLayout;
-    private EditText addressInput;
-    private TextView videoButtonLabel;
-    private ProgressBar pageProgress;
-    private WebView webView;
-    private FrameLayout webFrame;
-    private View blockedPrompt;
-    private Runnable dismissPromptRunnable;
-    private String pendingBlockedUrl;
-    private String pendingBlockedReason;
-    private volatile String currentPageUrl = "https://www.google.com/";
-    private long lastAdNoticeAt;
-    private String lastAdNoticeUrl = "";
-    private long lastUserNavigationAt;
-    private String expectedNavigationHost = "";
-    private String sessionPassword;
-    private boolean triedSessionPassword;
-    private boolean blobVideoDetected;
+    private Store store;
+    private String castorJs = "";
+    private int current = -1;
+    private boolean browserShown;
+    private boolean bootStarted;
 
-    private boolean isAdBlockEnabled() { return preferences.getBoolean(KEY_ADBLOCK, true); }
-    private boolean isRedirectBlockEnabled() { return preferences.getBoolean(KEY_REDIRECT_BLOCK, true); }
-    private boolean isPopupBlockEnabled() { return preferences.getBoolean(KEY_POPUP_BLOCK, true); }
-    private int getPromptSeconds() { return preferences.getInt(KEY_PROMPT_SECONDS, 3); }
+    // boot
+    private TextView bootStatus;
+
+    // interface principal
+    private FrameLayout outer;
+    private FrameLayout contentFrame;
+    private FrameLayout webHolder;
+    private ScrollView libraryScroll;
+    private ScrollView videosScroll;
+    private LinearLayout libraryBox;
+    private LinearLayout videosBox;
+    private EditText urlField;
+    private TextView tabsCount;
+    private ProgressBar progressBar;
+    private ImageView btnLibrary;
+    private ImageView btnBrowser;
+    private ImageView btnVideos;
+    private TextView videoBadge;
+    private int screen = SCREEN_BROWSER;
+    private int libraryTab = 0; // 0 = fila, 1 = histórico
+
+    // aviso de bloqueio
+    private LinearLayout noticeCard;
+    private TextView noticeReason;
+    private TextView noticeUrl;
+    private Runnable noticeHide;
+    private Tab noticeTab;
+    private String noticeTarget = "";
+
+    // tela cheia de vídeo
+    private View customView;
+    private WebChromeClient.CustomViewCallback customCallback;
+
+    private PopupWindow panel;
+
+    private static final class Tab {
+        WebView web;
+        volatile String url = "";
+        volatile String title = "";
+        volatile boolean finished;
+        volatile long lastTouch;
+        volatile boolean blobSeen;
+        volatile int blockedCount;
+        String allowOnce = "";
+        final LinkedHashMap<String, MediaItem> videos = new LinkedHashMap<>();
+
+        synchronized boolean addVideo(MediaItem m) {
+            if (videos.containsKey(m.url)) return false;
+            if (videos.size() >= 120) {
+                String first = videos.keySet().iterator().next();
+                videos.remove(first);
+            }
+            videos.put(m.url, m);
+            return true;
+        }
+
+        synchronized List<MediaItem> videoList() {
+            return new ArrayList<>(videos.values());
+        }
+
+        synchronized int videoCount() {
+            return videos.size();
+        }
+
+        synchronized void clearVideos() {
+            videos.clear();
+            blobSeen = false;
+            blockedCount = 0;
+        }
+    }
+
+    // ------------------------------------------------------------------ ciclo de vida
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
-
-        Window window = getWindow();
-        window.setStatusBarColor(Color.rgb(18, 19, 15));
-        window.setNavigationBarColor(Color.rgb(18, 19, 15));
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            window.setNavigationBarContrastEnforced(false);
-            window.setStatusBarContrastEnforced(false);
-        }
-
-        showBootScreen();
-        bootstrapEnvironment();
+        store = new Store(this);
+        castorJs = readAsset("castor.js");
+        filters.loadCache(getApplicationContext());
+        showBoot();
     }
 
-    // First-run boot is intentionally simple: only these two status stages are shown.
-    private void showBootScreen() {
-        bootRoot = new LinearLayout(this);
-        bootRoot.setOrientation(LinearLayout.VERTICAL);
-        bootRoot.setGravity(Gravity.CENTER);
-        bootRoot.setBackgroundColor(BG);
-        bootRoot.setPadding(dp(32), dp(32), dp(32), dp(32));
-
-        ImageView logo = new ImageView(this);
-        logo.setImageResource(com.castor.mobile.R.mipmap.ic_launcher);
-        logo.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        LinearLayout.LayoutParams logoParams = new LinearLayout.LayoutParams(dp(104), dp(104));
-        logoParams.bottomMargin = dp(20);
-        bootRoot.addView(logo, logoParams);
-
-        TextView brand = text("castor", 31, TEXT, true);
-        brand.setGravity(Gravity.CENTER);
-        bootRoot.addView(brand);
-
-        bootTitle = text("Baixando ambiente", 18, PEACH, true);
-        bootTitle.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        titleParams.topMargin = dp(36);
-        bootRoot.addView(bootTitle, titleParams);
-
-        bootSubtitle = text("Preparando a navegação e os filtros de proteção", 13, MUTED, false);
-        bootSubtitle.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        subtitleParams.topMargin = dp(8);
-        bootRoot.addView(bootSubtitle, subtitleParams);
-
-        bootProgress = new ProgressBar(this);
-        bootProgress.setIndeterminate(true);
-        bootProgress.setIndeterminateTintList(ColorStateList.valueOf(PEACH));
-        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(dp(180), dp(4));
-        progressParams.topMargin = dp(25);
-        bootRoot.addView(bootProgress, progressParams);
-        setContentView(bootRoot);
-    }
-
-    private void bootstrapEnvironment() {
-        bootstrapExecutor.execute(() -> {
-            String allRules = readCachedRules();
-            boolean cacheFresh = System.currentTimeMillis() - preferences.getLong(KEY_FILTER_REFRESH, 0L) < FILTER_REFRESH_MS;
-            if (!cacheFresh && hasNetwork()) {
-                String downloaded = downloadFilterSets();
-                if (!TextUtils.isEmpty(downloaded)) {
-                    allRules = downloaded;
-                    writeCachedRules(downloaded);
-                    preferences.edit().putLong(KEY_FILTER_REFRESH, System.currentTimeMillis()).apply();
-                }
-            }
-            filterEngine.clearDownloadedRules();
-            if (!TextUtils.isEmpty(allRules)) {
-                filterEngine.loadText(allRules);
-            } else {
-                try (InputStream in = getAssets().open("filters/base-blocklist.txt")) {
-                    filterEngine.load(in);
-                } catch (Exception ignored) { }
-            }
-            mainHandler.post(() -> {
-                bootTitle.setText("Iniciando");
-                bootSubtitle.setText("Preparando o navegador");
-                mainHandler.postDelayed(() -> {
-                    preferences.edit().putBoolean(KEY_FIRST_BOOT, true).apply();
-                    showBrowser();
-                }, 650);
-            });
-        });
-    }
-
-    private boolean hasNetwork() {
-        try {
-            ConnectivityManager manager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-            NetworkInfo info = manager == null ? null : manager.getActiveNetworkInfo();
-            return info != null && info.isConnected();
-        } catch (Exception ignored) {
-            return false;
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        Uri data = intent.getData();
+        if (browserShown && data != null) {
+            newTab(data.toString(), true);
+            showScreen(SCREEN_BROWSER);
         }
     }
 
-    private String readCachedRules() {
-        File cache = new File(getFilesDir(), "web-filter-rules.txt");
-        if (!cache.isFile()) return "";
-        try (InputStream in = new FileInputStream(cache)) {
-            return new String(readLimited(in, FILTER_MAX_BYTES * 2), StandardCharsets.UTF_8);
-        } catch (Exception ignored) {
-            return "";
-        }
+    @Override
+    protected void onPause() {
+        super.onPause();
+        Tab t = cur();
+        if (t != null && t.web != null) t.web.onPause();
     }
 
-    private void writeCachedRules(String content) {
-        if (TextUtils.isEmpty(content)) return;
-        File cache = new File(getFilesDir(), "web-filter-rules.txt");
-        try (OutputStream out = new FileOutputStream(cache, false)) {
-            out.write(content.getBytes(StandardCharsets.UTF_8));
-        } catch (Exception ignored) { }
+    @Override
+    protected void onResume() {
+        super.onResume();
+        Tab t = cur();
+        if (t != null && t.web != null) t.web.onResume();
     }
 
-    private String downloadFilterSets() {
-        String[] urls = {
-                "https://easylist.to/easylist/easylist.txt",
-                "https://easylist.to/easylist/easyprivacy.txt"
-        };
-        StringBuilder combined = new StringBuilder();
-        for (String address : urls) {
-            HttpURLConnection connection = null;
-            try {
-                connection = (HttpURLConnection) new URL(address).openConnection();
-                connection.setConnectTimeout(3500);
-                connection.setReadTimeout(4500);
-                connection.setInstanceFollowRedirects(true);
-                connection.setRequestProperty("User-Agent", "CastorAndroid/1.1 (filter updater)");
-                connection.setRequestProperty("Accept", "text/plain,*/*;q=0.8");
-                connection.connect();
-                if (connection.getResponseCode() >= 200 && connection.getResponseCode() < 300) {
-                    try (InputStream in = connection.getInputStream()) {
-                        byte[] bytes = readLimited(in, FILTER_MAX_BYTES);
-                        String text = new String(bytes, StandardCharsets.UTF_8);
-                        if (text.contains("!") || text.contains("||")) {
-                            combined.append("\n! source: ").append(address).append("\n").append(text).append('\n');
-                        }
-                    }
-                }
-            } catch (Exception ignored) {
-                // Bundled fallback rules remain available if a filter host is offline.
-            } finally {
-                if (connection != null) connection.disconnect();
-            }
-        }
-        return combined.length() > 0 ? combined.toString() : "";
-    }
-
-    private byte[] readLimited(InputStream in, int limit) throws java.io.IOException {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        int read;
-        while ((read = in.read(buffer)) != -1) {
-            int remaining = limit - output.size();
-            if (remaining <= 0) break;
-            output.write(buffer, 0, Math.min(read, remaining));
-        }
-        return output.toByteArray();
-    }
-
-    private void showBrowser() {
-        rootLayout = new LinearLayout(this);
-        rootLayout.setOrientation(LinearLayout.VERTICAL);
-        rootLayout.setBackgroundColor(BG);
-        rootLayout.setPadding(dp(10), dp(7), dp(10), dp(5));
-        setContentView(rootLayout);
-
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-
-        ImageView icon = new ImageView(this);
-        icon.setImageResource(R.mipmap.ic_launcher);
-        icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        LinearLayout.LayoutParams iconParams = new LinearLayout.LayoutParams(dp(34), dp(34));
-        iconParams.rightMargin = dp(8);
-        header.addView(icon, iconParams);
-
-        LinearLayout brand = new LinearLayout(this);
-        brand.setOrientation(LinearLayout.VERTICAL);
-        TextView title = text("castor", 22, TEXT, true);
-        TextView subtitle = text("NAVEGADOR", 9, PEACH, true);
-        subtitle.setLetterSpacing(0.12f);
-        brand.addView(title);
-        brand.addView(subtitle);
-        header.addView(brand, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-        Button settings = button("⚙", PANEL_LIGHT, TEXT);
-        settings.setContentDescription("Configurações");
-        header.addView(settings, new LinearLayout.LayoutParams(dp(46), dp(42)));
-        settings.setOnClickListener(v -> showSettings());
-        rootLayout.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        LinearLayout addressRow = new LinearLayout(this);
-        addressRow.setOrientation(LinearLayout.HORIZONTAL);
-        addressRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams addressRowParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
-        addressRowParams.topMargin = dp(8);
-
-        addressInput = new EditText(this);
-        addressInput.setSingleLine(true);
-        addressInput.setTextSize(14);
-        addressInput.setTextColor(TEXT);
-        addressInput.setHintTextColor(MUTED);
-        addressInput.setHint("Pesquisar ou digitar endereço");
-        addressInput.setImeOptions(EditorInfo.IME_ACTION_GO);
-        addressInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        addressInput.setSelectAllOnFocus(false);
-        addressInput.setPadding(dp(14), 0, dp(10), 0);
-        addressInput.setBackground(roundRect(PANEL, dp(13), null));
-        addressRow.addView(addressInput, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
-
-        Button go = button("Ir", PEACH, Color.rgb(29, 27, 22));
-        LinearLayout.LayoutParams goParams = new LinearLayout.LayoutParams(dp(52), ViewGroup.LayoutParams.MATCH_PARENT);
-        goParams.leftMargin = dp(6);
-        addressRow.addView(go, goParams);
-        go.setOnClickListener(v -> navigateFromAddress());
-        addressInput.setOnEditorActionListener((v, actionId, event) -> {
-            if (actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_DONE
-                    || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
-                navigateFromAddress();
-                return true;
-            }
-            return false;
-        });
-        rootLayout.addView(addressRow, addressRowParams);
-
-        pageProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        pageProgress.setMax(100);
-        pageProgress.setProgressTintList(ColorStateList.valueOf(PEACH));
-        pageProgress.setProgressBackgroundTintList(ColorStateList.valueOf(PANEL));
-        pageProgress.setVisibility(View.GONE);
-        rootLayout.addView(pageProgress, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3)));
-
-        webFrame = new FrameLayout(this);
-        webFrame.setBackgroundColor(BG);
-        LinearLayout.LayoutParams webFrameParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        webFrameParams.topMargin = dp(5);
-        rootLayout.addView(webFrame, webFrameParams);
-
-        webView = new WebView(this);
-        WebSettings settingsWeb = webView.getSettings();
-        settingsWeb.setJavaScriptEnabled(true);
-        settingsWeb.setDomStorageEnabled(true);
-        settingsWeb.setLoadsImagesAutomatically(true);
-        settingsWeb.setMediaPlaybackRequiresUserGesture(false);
-        settingsWeb.setAllowFileAccess(false);
-        settingsWeb.setAllowContentAccess(false);
-        settingsWeb.setJavaScriptCanOpenWindowsAutomatically(true);
-        settingsWeb.setSupportMultipleWindows(true);
-        settingsWeb.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) settingsWeb.setSafeBrowsingEnabled(true);
-        webView.setBackgroundColor(Color.WHITE);
-        webView.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        webView.addJavascriptInterface(new CastorBridge(), "CastorBridge");
-        webView.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public void onProgressChanged(WebView view, int newProgress) {
-                pageProgress.setProgress(newProgress);
-                pageProgress.setVisibility(newProgress >= 100 ? View.GONE : View.VISIBLE);
-                if (newProgress >= 100) updateVideoButton();
-            }
-
-            @Override
-            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
-                // Capture the URL in a throwaway WebView; never leave a second tab running.
-                final WebView popupWebView = new WebView(MainActivity.this);
-                popupWebView.getSettings().setJavaScriptEnabled(true);
-                popupWebView.setWebViewClient(new WebViewClient() {
-                    private boolean handled;
-                    private void captureAndClose(String url) {
-                        if (handled) return;
-                        handled = true;
-                        mainHandler.post(() -> handlePopupRequest(url));
-                        try { popupWebView.stopLoading(); popupWebView.destroy(); } catch (Exception ignored) { }
-                    }
-                    @Override
-                    public boolean shouldOverrideUrlLoading(WebView child, WebResourceRequest request) {
-                        captureAndClose(request.getUrl().toString());
-                        return true;
-                    }
-                    @Override
-                    @SuppressWarnings("deprecation")
-                    public boolean shouldOverrideUrlLoading(WebView child, String url) {
-                        captureAndClose(url);
-                        return true;
-                    }
-                });
-                if (resultMsg == null || !(resultMsg.obj instanceof WebView.WebViewTransport)) {
-                    popupWebView.destroy();
-                    return false;
-                }
-                WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
-                transport.setWebView(popupWebView);
-                resultMsg.sendToTarget();
-                return true;
-            }
-        });
-        webView.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return handleNavigation(request);
-            }
-
-            @Override
-            @SuppressWarnings("deprecation")
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                return handleLegacyNavigation(url);
-            }
-
-            @Override
-            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                String requestUrl = request.getUrl().toString();
-                boolean isMainFrame = request.isForMainFrame();
-                if (isAdBlockEnabled() && filterEngine.shouldBlock(requestUrl, currentPageUrl, isMainFrame)) {
-                    maybeShowAdBlocked(requestUrl);
-                    return emptyBlockedResponse();
-                }
-                if (isSupportedMediaUrl(requestUrl)) captureMedia(requestUrl, "rede");
-                return super.shouldInterceptRequest(view, request);
-            }
-
-            @Override
-            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                currentPageUrl = url;
-                runOnUiThread(() -> {
-                    if (addressInput != null) addressInput.setText(url);
-                    synchronized (foundVideos) { foundVideos.clear(); }
-                    blobVideoDetected = false;
-                    if (isSupportedMediaUrl(url)) captureMedia(url, "página");
-                    updateVideoButton();
-                });
-                super.onPageStarted(view, url, favicon);
-            }
-
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                currentPageUrl = url;
-                injectBrowserHelpers(view);
-                if (addressInput != null) addressInput.setText(url);
-                super.onPageFinished(view, url);
-            }
-
-            @Override
-            public void onReceivedHttpAuthRequest(WebView view, HttpAuthHandler handler, String host, String realm) {
-                promptForPassword(handler);
-            }
-
-            @Override
-            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                if (request.isForMainFrame()) {
-                    Toast.makeText(MainActivity.this, "Não foi possível abrir esta página.", Toast.LENGTH_SHORT).show();
-                }
-            }
-
-            @Override
-            public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
-                handler.cancel();
-                Toast.makeText(MainActivity.this, "Certificado HTTPS inválido; conexão bloqueada.", Toast.LENGTH_LONG).show();
-            }
-        });
-        webFrame.addView(webView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        LinearLayout bottomBar = new LinearLayout(this);
-        bottomBar.setOrientation(LinearLayout.HORIZONTAL);
-        bottomBar.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams bottomParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
-        bottomParams.topMargin = dp(5);
-
-        Button back = button("‹", PANEL_LIGHT, TEXT);
-        Button forward = button("›", PANEL_LIGHT, TEXT);
-        Button home = button("⌂", PANEL_LIGHT, TEXT);
-        Button reload = button("↻", PANEL_LIGHT, TEXT);
-        Button videos = button("Extrair · 0", PEACH, Color.rgb(29, 27, 22));
-        videoButtonLabel = videos;
-        addBarButton(bottomBar, back, 0.7f);
-        addBarButton(bottomBar, forward, 0.7f);
-        addBarButton(bottomBar, home, 0.7f);
-        addBarButton(bottomBar, reload, 0.7f);
-        addBarButton(bottomBar, videos, 1.5f);
-        rootLayout.addView(bottomBar, bottomParams);
-
-        back.setOnClickListener(v -> { if (webView.canGoBack()) webView.goBack(); });
-        forward.setOnClickListener(v -> { if (webView.canGoForward()) webView.goForward(); });
-        home.setOnClickListener(v -> loadUserUrl("https://www.google.com/"));
-        reload.setOnClickListener(v -> webView.reload());
-        videos.setOnClickListener(v -> showVideos());
-
-        loadUserUrl("https://www.google.com/");
-    }
-
-    private void addBarButton(LinearLayout row, Button button, float weight) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, weight);
-        params.leftMargin = dp(3);
-        params.rightMargin = dp(3);
-        row.addView(button, params);
-    }
-
-    private boolean handleNavigation(WebResourceRequest request) {
-        Uri uri = request.getUrl();
-        String url = uri.toString();
-        String scheme = uri.getScheme();
-        if (scheme == null) return true;
-        if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
-            openExternalScheme(uri);
-            return true;
-        }
-        if (request.isForMainFrame() && isRedirectBlockEnabled() && request.isRedirect()) {
-            boolean explicitlyInitiated = System.currentTimeMillis() - lastUserNavigationAt < 2500L
-                    && sameHost(expectedNavigationHost, uri.getHost());
-            String currentHost = Uri.parse(currentPageUrl).getHost();
-            boolean sameSiteRedirect = sameHost(currentHost, uri.getHost()) || sameHost(uri.getHost(), currentHost);
-            if (!explicitlyInitiated && !sameSiteRedirect) {
-                showBlockedNotice(url, "redirecionamento automático", true);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean handleLegacyNavigation(String rawUrl) {
-        Uri uri = Uri.parse(rawUrl);
-        String scheme = uri.getScheme();
-        if (scheme == null) return true;
-        if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) return false;
-        openExternalScheme(uri);
-        return true;
-    }
-
-    private void openExternalScheme(Uri uri) {
-        String scheme = uri.getScheme();
-        if (scheme == null) return;
-        if ("mailto".equalsIgnoreCase(scheme) || "tel".equalsIgnoreCase(scheme) || "intent".equalsIgnoreCase(scheme)) {
-            try {
-                startActivity(new Intent(Intent.ACTION_VIEW, uri));
-            } catch (Exception ignored) {
-                Toast.makeText(this, "Não há aplicativo compatível para este link.", Toast.LENGTH_SHORT).show();
-            }
-        }
-    }
-
-    private void navigateFromAddress() {
-        String raw = addressInput.getText().toString().trim();
-        if (TextUtils.isEmpty(raw)) return;
-        String target;
-        if (raw.matches("(?i)^[a-z][a-z0-9+.-]*://.*")) {
-            target = raw;
-        } else if (raw.contains(" ") || !raw.contains(".") || raw.contains("\\")) {
-            target = "https://www.google.com/search?q=" + Uri.encode(raw);
-        } else {
-            target = "https://" + raw;
-        }
-        Uri uri = Uri.parse(target);
-        if (uri.getHost() == null || (!"http".equalsIgnoreCase(uri.getScheme()) && !"https".equalsIgnoreCase(uri.getScheme()))) {
-            Toast.makeText(this, "Endereço inválido.", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        loadUserUrl(target);
-    }
-
-    private void loadUserUrl(String url) {
-        if (webView == null) return;
-        Uri uri = Uri.parse(url);
-        lastUserNavigationAt = System.currentTimeMillis();
-        expectedNavigationHost = uri.getHost() == null ? "" : uri.getHost();
-        if (addressInput != null) addressInput.setText(url);
-        webView.loadUrl(url);
-    }
-
-    private boolean sameHost(String a, String b) {
-        return a != null && b != null && (a.equalsIgnoreCase(b) || b.toLowerCase(Locale.ROOT).endsWith("." + a.toLowerCase(Locale.ROOT)));
-    }
-
-
-    private WebResourceResponse emptyBlockedResponse() {
-        return new WebResourceResponse("text/plain", "utf-8", 204, "Blocked by Castor", new java.util.HashMap<>(), new ByteArrayInputStream(new byte[0]));
-    }
-
-    private void injectBrowserHelpers(WebView view) {
-        String script = "(function(){try{" +
-                "if(window.__castorHelpersInstalled)return;window.__castorHelpersInstalled=true;" +
-                "function send(){try{var out=[],seen={};function add(u){if(!u||typeof u!=='string'||u.indexOf('blob:')===0||u.indexOf('data:')===0)return; if(seen[u])return;seen[u]=1;out.push(u)}" +
-                "document.querySelectorAll('video').forEach(function(v){if((v.currentSrc||v.src||'').indexOf('blob:')===0){try{CastorBridge.onBlobMedia()}catch(x){}}add(v.currentSrc);add(v.src);v.querySelectorAll('source').forEach(function(s){add(s.src)})});" +
-                "document.querySelectorAll('source').forEach(function(s){add(s.src)});" +
-                "document.querySelectorAll('a[href]').forEach(function(a){if(/\\.(m3u8|mp4|mpd|webm|m4v|mov|mkv|ts|3gp|flv|mp3|m4a|aac|ogg|wav)(?:$|[?#])/i.test(a.href))add(a.href)});" +
-                "performance.getEntriesByType('resource').forEach(function(r){if(/\\.(m3u8|mp4|mpd|webm|m4v|mov|mkv|ts|3gp|flv|mp3|m4a|aac|ogg|wav)(?:$|[?#])/i.test(r.name))add(r.name)});" +
-                "CastorBridge.onMediaList(JSON.stringify(out));" +
-                "}catch(e){}}" +
-                "window.open=function(u){try{CastorBridge.onPopup(String(u||location.href))}catch(e){}return null};" +
-                "document.addEventListener('click',function(e){var a=e.target&&e.target.closest?e.target.closest('a[target=_blank],a[target=\\\"_blank\\\"]'):null;if(a){e.preventDefault();e.stopImmediatePropagation();try{CastorBridge.onPopup(a.href)}catch(x){}}},true);" +
-                "send();new MutationObserver(send).observe(document.documentElement||document,{childList:true,subtree:true,attributes:true});setInterval(send,3000);" +
-                "}catch(e){}})();";
-        view.evaluateJavascript(script, null);
-    }
-
-    private boolean isSupportedMediaUrl(String rawUrl) {
-        if (TextUtils.isEmpty(rawUrl)) return false;
-        String url = rawUrl.toLowerCase(Locale.ROOT);
-        if (!(url.startsWith("http://") || url.startsWith("https://"))) return false;
-        int query = url.indexOf('?');
-        int hash = url.indexOf('#');
-        int end = url.length();
-        if (query >= 0) end = Math.min(end, query);
-        if (hash >= 0) end = Math.min(end, hash);
-        String path = url.substring(0, end);
-        String[] extensions = {".m3u8", ".mp4", ".mpd", ".webm", ".m4v", ".mov", ".mkv", ".ts", ".3gp", ".flv", ".mp3", ".m4a", ".aac", ".ogg", ".wav"};
-        for (String extension : extensions) if (path.endsWith(extension)) return true;
-        return false;
-    }
-
-    private void captureMedia(String url, String source) {
-        if (!isSupportedMediaUrl(url)) return;
-        synchronized (foundVideos) {
-            if (!foundVideos.containsKey(url)) {
-                if (foundVideos.size() >= 120) {
-                    String firstKey = foundVideos.keySet().iterator().next();
-                    foundVideos.remove(firstKey);
-                }
-                foundVideos.put(url, new VideoItem(url, guessTitle(url), source));
-            }
-        }
-        runOnUiThread(this::updateVideoButton);
-    }
-
-    private String guessTitle(String url) {
-        Uri uri = Uri.parse(url);
-        String path = uri.getLastPathSegment();
-        if (TextUtils.isEmpty(path)) return "Vídeo encontrado";
-        path = Uri.decode(path);
-        if (path.length() > 58) path = path.substring(0, 55) + "…";
-        return path;
-    }
-
-    private void updateVideoButton() {
-        if (videoButtonLabel == null) return;
-        int count;
-        synchronized (foundVideos) { count = foundVideos.size(); }
-        videoButtonLabel.setText("Extrair · " + count);
-    }
-
-    private void showVideos() {
-        List<VideoItem> items;
-        synchronized (foundVideos) { items = new ArrayList<>(foundVideos.values()); }
-        if (items.isEmpty()) {
-            String message = blobVideoDetected
-                    ? "A página usa um vídeo blob: ou um fluxo que não expõe uma URL direta. Esse formato pode exigir um extrator específico e nem sempre pode ser reproduzido fora da página."
-                    : "Nenhuma URL direta de mídia foi detectada ainda. Inicie o vídeo na página e abra esta lista novamente. Formatos diretos comuns incluem MP4, M3U8/HLS, MPD/DASH e WebM.";
-            new AlertDialog.Builder(this).setTitle("Vídeos da página").setMessage(message).setPositiveButton("OK", null).show();
-            return;
-        }
-        String[] labels = new String[items.size()];
-        for (int i = 0; i < items.size(); i++) {
-            VideoItem item = items.get(i);
-            labels[i] = item.title + "\n" + mediaType(item.url) + " · " + Uri.parse(item.url).getHost();
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("Vídeos encontrados (" + items.size() + ")")
-                .setItems(labels, (dialog, which) -> showVideoActions(items.get(which)))
-                .setNegativeButton("Fechar", null)
-                .show();
-    }
-
-    private String mediaType(String url) {
-        String clean = url.toLowerCase(Locale.ROOT).split("[?#]", 2)[0];
-        if (clean.endsWith(".m3u8")) return "M3U8 / HLS";
-        if (clean.endsWith(".mpd")) return "MPD / DASH";
-        if (clean.endsWith(".mp4")) return "MP4";
-        if (clean.endsWith(".webm")) return "WebM";
-        if (clean.endsWith(".mkv")) return "MKV";
-        if (clean.endsWith(".ts")) return "MPEG-TS";
-        if (clean.endsWith(".mp3") || clean.endsWith(".m4a") || clean.endsWith(".aac") || clean.endsWith(".ogg") || clean.endsWith(".wav")) return "Áudio";
-        return "Mídia";
-    }
-
-    private void showVideoActions(VideoItem item) {
-        TextView urlText = text(mediaType(item.url) + "\nEncontrado em: " + item.source + "\n\n" + item.url, 12, MUTED, false);
-        urlText.setTextIsSelectable(true);
-        urlText.setPadding(dp(4), dp(4), dp(4), dp(4));
-        new AlertDialog.Builder(this)
-                .setTitle(item.title)
-                .setView(urlText)
-                .setPositiveButton("Reproduzir", (d, which) -> {
-                    try {
-                        Intent intent = new Intent(Intent.ACTION_VIEW);
-                        intent.setDataAndType(Uri.parse(item.url), "video/*");
-                        startActivity(intent);
-                    } catch (Exception e) {
-                        new AlertDialog.Builder(this).setMessage("Não há reprodutor compatível instalado. Você pode copiar o link e abri-lo em um reprodutor que suporte " + mediaType(item.url) + ".")
-                                .setPositiveButton("OK", null).show();
-                    }
-                })
-                .setNeutralButton("Copiar link", (d, which) -> {
-                    ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-                    if (clipboard != null) clipboard.setPrimaryClip(ClipData.newPlainText("URL do vídeo", item.url));
-                    Toast.makeText(this, "Link copiado.", Toast.LENGTH_SHORT).show();
-                })
-                .setNegativeButton("Compartilhar", (d, which) -> {
-                    Intent share = new Intent(Intent.ACTION_SEND);
-                    share.setType("text/plain");
-                    share.putExtra(Intent.EXTRA_TEXT, item.url);
-                    startActivity(Intent.createChooser(share, "Compartilhar link do vídeo"));
-                }).show();
-    }
-
-    private void maybeShowAdBlocked(String url) {
-        long now = System.currentTimeMillis();
-        synchronized (this) {
-            if (now - lastAdNoticeAt < 4500L) return;
-            if (url.equals(lastAdNoticeUrl) && now - lastAdNoticeAt < 12000L) return;
-            lastAdNoticeAt = now;
-            lastAdNoticeUrl = url;
-        }
-        showBlockedNotice(url, "anúncio ou rastreador", true);
-    }
-
-    private void showBlockedNotice(String url, String reason, boolean actionable) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            mainHandler.post(() -> showBlockedNotice(url, reason, actionable));
-            return;
-        }
-        if (webFrame == null || isFinishing()) return;
-        pendingBlockedUrl = url;
-        pendingBlockedReason = reason;
-        if (blockedPrompt != null) {
-            webFrame.removeView(blockedPrompt);
-            blockedPrompt = null;
-        }
-        if (dismissPromptRunnable != null) mainHandler.removeCallbacks(dismissPromptRunnable);
-
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(13), dp(10), dp(13), dp(9));
-        card.setBackground(roundRect(PANEL, dp(15), PEACH));
-        card.setElevation(dp(8));
-
-        TextView header = text("Bloqueado: " + reason, 13, PEACH, true);
-        card.addView(header);
-        String displayUrl = url == null ? "Link não identificado" : url;
-        if (displayUrl.length() > 130) displayUrl = displayUrl.substring(0, 126) + "…";
-        TextView link = text(displayUrl, 11, TEXT, false);
-        link.setMaxLines(2);
-        link.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        LinearLayout.LayoutParams linkParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        linkParams.topMargin = dp(3);
-        card.addView(link, linkParams);
-
-        LinearLayout actions = new LinearLayout(this);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36));
-        actionsParams.topMargin = dp(4);
-        Button ignore = button("Ignorar", PANEL_LIGHT, TEXT);
-        Button open = button("Abrir", PEACH, Color.rgb(29, 27, 22));
-        actions.addView(ignore, new LinearLayout.LayoutParams(dp(86), ViewGroup.LayoutParams.MATCH_PARENT));
-        LinearLayout.LayoutParams openParams = new LinearLayout.LayoutParams(dp(86), ViewGroup.LayoutParams.MATCH_PARENT);
-        openParams.leftMargin = dp(6);
-        actions.addView(open, openParams);
-        card.addView(actions, actionsParams);
-        ignore.setOnClickListener(v -> dismissBlockedNotice());
-        open.setOnClickListener(v -> {
-            String target = pendingBlockedUrl;
-            dismissBlockedNotice();
-            if (!TextUtils.isEmpty(target)) loadUserUrl(target);
-        });
-        if (!actionable) {
-            open.setVisibility(View.GONE);
-        }
-
-        FrameLayout.LayoutParams cardParams = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        cardParams.setMargins(dp(10), dp(10), dp(10), dp(10));
-        webFrame.addView(card, cardParams);
-        blockedPrompt = card;
-
-        int seconds = getPromptSeconds();
-        if (seconds > 0) {
-            dismissPromptRunnable = this::dismissBlockedNotice;
-            mainHandler.postDelayed(dismissPromptRunnable, seconds * 1000L);
-        }
-    }
-
-    private void dismissBlockedNotice() {
-        if (dismissPromptRunnable != null) mainHandler.removeCallbacks(dismissPromptRunnable);
-        dismissPromptRunnable = null;
-        if (webFrame != null && blockedPrompt != null) webFrame.removeView(blockedPrompt);
-        blockedPrompt = null;
-        pendingBlockedUrl = null;
-        pendingBlockedReason = null;
-    }
-
-    private void handlePopupRequest(String rawUrl) {
-        String url = rawUrl == null ? currentPageUrl : rawUrl.trim();
-        if (TextUtils.isEmpty(url) || "null".equals(url)) url = currentPageUrl;
-        Uri uri = Uri.parse(url);
-        if (uri.getScheme() == null || (!"http".equalsIgnoreCase(uri.getScheme()) && !"https".equalsIgnoreCase(uri.getScheme()))) return;
-        if (isPopupBlockEnabled()) {
-            showBlockedNotice(url, "pop-up ou nova janela", true);
-        } else {
-            loadUserUrl(url);
-        }
-    }
-
-    private void promptForPassword(HttpAuthHandler handler) {
-        EditText passwordInput = new EditText(this);
-        passwordInput.setSingleLine(true);
-        passwordInput.setTextColor(TEXT);
-        passwordInput.setHintTextColor(MUTED);
-        passwordInput.setHint("Senha do site");
-        passwordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        passwordInput.setPadding(dp(12), dp(10), dp(12), dp(10));
-        passwordInput.setBackground(roundRect(PANEL, dp(10), PEACH));
-        if (sessionPassword != null) passwordInput.setText(sessionPassword);
-        new AlertDialog.Builder(this)
-                .setTitle("Autenticação do site")
-                .setView(passwordInput)
-                .setPositiveButton("Entrar", (dialog, which) -> {
-                    String password = passwordInput.getText().toString();
-                    if (TextUtils.isEmpty(password)) handler.cancel();
-                    else {
-                        sessionPassword = password;
-                        triedSessionPassword = true;
-                        handler.proceed("castor", password);
-                    }
-                })
-                .setNegativeButton("Cancelar", (dialog, which) -> handler.cancel())
-                .setOnCancelListener(dialog -> handler.cancel())
-                .show();
-    }
-
-    private void showSettings() {
-        LinearLayout panel = new LinearLayout(this);
-        panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(18), dp(8), dp(18), dp(8));
-        panel.setBackgroundColor(BG);
-
-        TextView intro = text("Proteção de navegação", 18, TEXT, true);
-        panel.addView(intro);
-        TextView description = text("Os bloqueios começam ativados. Os filtros são atualizados automaticamente quando há internet.", 12, MUTED, false);
-        LinearLayout.LayoutParams descParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        descParams.topMargin = dp(5);
-        panel.addView(description, descParams);
-
-        Switch ads = settingsSwitch("Bloqueador de anúncios e rastreadores", isAdBlockEnabled());
-        Switch redirects = settingsSwitch("Bloqueador de redirecionamentos", isRedirectBlockEnabled());
-        Switch popups = settingsSwitch("Bloqueador de pop-ups e novas janelas", isPopupBlockEnabled());
-        panel.addView(ads, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        panel.addView(redirects, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        panel.addView(popups, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        TextView durationLabel = text("Tempo do aviso: " + durationText(getPromptSeconds()), 13, TEXT, true);
-        LinearLayout.LayoutParams durationParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        durationParams.topMargin = dp(12);
-        panel.addView(durationLabel, durationParams);
-        SeekBar duration = new SeekBar(this);
-        duration.setMax(15);
-        duration.setProgress(getPromptSeconds());
-        duration.setProgressTintList(ColorStateList.valueOf(PEACH));
-        duration.setThumbTintList(ColorStateList.valueOf(PEACH));
-        duration.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                durationLabel.setText("Tempo do aviso: " + durationText(progress));
-            }
-            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
-            @Override public void onStopTrackingTouch(SeekBar seekBar) { }
-        });
-        panel.addView(duration);
-        TextView durationHint = text("0 = fica na tela até você escolher. Máximo: 15 segundos.", 11, MUTED, false);
-        panel.addView(durationHint);
-
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setView(panel)
-                .setPositiveButton("Salvar", null)
-                .setNegativeButton("Cancelar", null)
-                .create();
-        dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
-            preferences.edit()
-                    .putBoolean(KEY_ADBLOCK, ads.isChecked())
-                    .putBoolean(KEY_REDIRECT_BLOCK, redirects.isChecked())
-                    .putBoolean(KEY_POPUP_BLOCK, popups.isChecked())
-                    .putInt(KEY_PROMPT_SECONDS, duration.getProgress())
-                    .apply();
-            dialog.dismiss();
-            if (webView != null) webView.reload();
-            Toast.makeText(this, "Configurações salvas.", Toast.LENGTH_SHORT).show();
-        }));
-        dialog.show();
-        dialog.getWindow().setBackgroundDrawable(roundRect(PANEL, dp(18), null));
-    }
-
-    private Switch settingsSwitch(String label, boolean checked) {
-        Switch toggle = new Switch(this);
-        toggle.setText(label);
-        toggle.setTextSize(13);
-        toggle.setTextColor(TEXT);
-        toggle.setChecked(checked);
-        toggle.setPadding(0, dp(9), 0, dp(9));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            toggle.setThumbTintList(new ColorStateList(
-                    new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
-                    new int[]{PEACH, MUTED}));
-            toggle.setTrackTintList(new ColorStateList(
-                    new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
-                    new int[]{Color.rgb(112, 80, 60), PANEL_LIGHT}));
-        }
-        return toggle;
-    }
-
-    private String durationText(int seconds) {
-        return seconds == 0 ? "até escolher" : seconds + (seconds == 1 ? " segundo" : " segundos");
-    }
-
-    private TextView text(String value, float sp, int color, boolean bold) {
-        TextView view = new TextView(this);
-        view.setText(value);
-        view.setTextSize(sp);
-        view.setTextColor(color);
-        if (bold) view.setTypeface(null, Typeface.BOLD);
-        return view;
-    }
-
-    private Button button(String label, int background, int foreground) {
-        Button button = new Button(this);
-        button.setText(label);
-        button.setTextColor(foreground);
-        button.setTextSize(13);
-        button.setAllCaps(false);
-        button.setTypeface(null, Typeface.BOLD);
-        button.setMinWidth(0);
-        button.setMinimumWidth(0);
-        button.setPadding(dp(7), 0, dp(7), 0);
-        button.setBackground(roundRect(background, dp(12), null));
-        return button;
-    }
-
-    private GradientDrawable roundRect(int color, int radius, Integer stroke) {
-        GradientDrawable drawable = new GradientDrawable();
-        drawable.setColor(color);
-        drawable.setCornerRadius(radius);
-        if (stroke != null) drawable.setStroke(dp(1), stroke);
-        return drawable;
-    }
-
-    private int dp(float value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        ui.removeCallbacksAndMessages(null);
+        io.shutdownNow();
+        for (Tab t : tabs) destroyWeb(t);
+        tabs.clear();
     }
 
     @Override
     public void onBackPressed() {
-        if (blockedPrompt != null) {
-            dismissBlockedNotice();
-        } else if (webView != null && webView.canGoBack()) {
-            webView.goBack();
+        if (customView != null) {
+            hideCustomView();
+            return;
+        }
+        if (!browserShown) {
+            super.onBackPressed();
+            return;
+        }
+        if (panel != null && panel.isShowing()) {
+            panel.dismiss();
+            return;
+        }
+        if (screen != SCREEN_BROWSER) {
+            showScreen(SCREEN_BROWSER);
+            return;
+        }
+        Tab t = cur();
+        if (t != null && t.web.canGoBack()) {
+            t.web.goBack();
+        } else if (tabs.size() > 1) {
+            closeTab(current);
         } else {
             super.onBackPressed();
         }
     }
 
-    @Override
-    protected void onDestroy() {
-        if (dismissPromptRunnable != null) mainHandler.removeCallbacks(dismissPromptRunnable);
-        if (webView != null) {
-            webView.stopLoading();
-            webView.removeJavascriptInterface("CastorBridge");
-            webView.setWebChromeClient(null);
-            webView.setWebViewClient(null);
-            webView.destroy();
-        }
-        bootstrapExecutor.shutdownNow();
-        super.onDestroy();
+    // ------------------------------------------------------------------ tela de início
+
+    private void showBoot() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setGravity(Gravity.CENTER);
+        root.setBackgroundColor(BG);
+        root.setPadding(dp(32), dp(32), dp(32), dp(32));
+
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.mipmap.ic_launcher);
+        root.addView(logo, new LinearLayout.LayoutParams(dp(96), dp(96)));
+
+        TextView title = text("Castor", 28, TEXT, true);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, dp(16), 0, dp(6));
+        root.addView(title);
+
+        bootStatus = text("Baixando ambiente", 15, MUTED, false);
+        bootStatus.setGravity(Gravity.CENTER);
+        root.addView(bootStatus);
+
+        ProgressBar pb = new ProgressBar(this);
+        pb.setIndeterminate(true);
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(dp(40), dp(40));
+        plp.topMargin = dp(22);
+        root.addView(pb, plp);
+
+        setContentView(root);
+
+        // download das listas de bloqueio em segundo plano
+        io.execute(() -> {
+            boolean stale = System.currentTimeMillis() - store.filterTime() > DAY_MS || filters.size() < 1500;
+            if (stale && hasNetwork()) {
+                if (filters.download(getApplicationContext())) {
+                    store.setFilterTime(System.currentTimeMillis());
+                }
+            }
+            ui.post(this::startBrowserSoon);
+        });
+        // nunca prende o usuário na tela de início
+        ui.postDelayed(this::startBrowserSoon, 3500);
     }
 
-    private final class CastorBridge {
-        @JavascriptInterface
-        public void onMediaList(String payload) {
-            try {
-                JSONArray array = new JSONArray(payload);
-                for (int i = 0; i < array.length(); i++) {
-                    String url = array.optString(i, "");
-                    if (isSupportedMediaUrl(url)) captureMedia(url, "página");
-                    else if (url.startsWith("blob:")) blobVideoDetected = true;
+    private void startBrowserSoon() {
+        if (bootStarted) return;
+        bootStarted = true;
+        if (bootStatus != null) bootStatus.setText("Iniciando");
+        ui.postDelayed(this::showBrowser, 450);
+    }
+
+    private boolean hasNetwork() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            NetworkInfo ni = cm == null ? null : cm.getActiveNetworkInfo();
+            return ni != null && ni.isConnected();
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    // ------------------------------------------------------------------ interface principal
+
+    private void showBrowser() {
+        if (browserShown) return;
+        browserShown = true;
+
+        outer = new FrameLayout(this);
+        outer.setBackgroundColor(BG);
+
+        LinearLayout main = new LinearLayout(this);
+        main.setOrientation(LinearLayout.VERTICAL);
+        main.setBackgroundColor(BG);
+        outer.addView(main, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // ---- barra superior: endereço | abas | engrenagem
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        top.setBackgroundColor(PANEL);
+        top.setPadding(dp(8), dp(8), dp(8), dp(8));
+
+        urlField = new EditText(this);
+        urlField.setSingleLine(true);
+        urlField.setTextColor(TEXT);
+        urlField.setHintTextColor(MUTED);
+        urlField.setHint("Pesquisar ou digitar endereço");
+        urlField.setTextSize(15);
+        urlField.setBackground(roundRect(PANEL_LIGHT, dp(21), null));
+        urlField.setPadding(dp(16), 0, dp(16), 0);
+        urlField.setImeOptions(EditorInfo.IME_ACTION_GO);
+        urlField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        urlField.setSelectAllOnFocus(true);
+        urlField.setOnEditorActionListener((v, actionId, event) -> {
+            goFromField();
+            return true;
+        });
+        top.addView(urlField, new LinearLayout.LayoutParams(0, dp(42), 1f));
+
+        tabsCount = text("1", 14, TEXT, true);
+        tabsCount.setGravity(Gravity.CENTER);
+        tabsCount.setBackground(roundRect(Color.TRANSPARENT, dp(7), TEXT));
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(dp(30), dp(30));
+        tlp.leftMargin = dp(10);
+        tabsCount.setOnClickListener(v -> showTabsDialog());
+        top.addView(tabsCount, tlp);
+
+        ImageView gear = icon(R.drawable.ic_gear, TEXT);
+        gear.setPadding(dp(6), dp(6), dp(6), dp(6));
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(dp(42), dp(42));
+        glp.leftMargin = dp(4);
+        gear.setOnClickListener(v -> showBlockPanel(v));
+        top.addView(gear, glp);
+
+        main.addView(top, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar.setMax(100);
+        progressBar.setProgress(0);
+        progressBar.setVisibility(View.INVISIBLE);
+        main.addView(progressBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3)));
+
+        // ---- conteúdo: navegador / biblioteca / vídeos
+        contentFrame = new FrameLayout(this);
+        main.addView(contentFrame, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        webHolder = new FrameLayout(this);
+        contentFrame.addView(webHolder, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        libraryBox = new LinearLayout(this);
+        libraryBox.setOrientation(LinearLayout.VERTICAL);
+        libraryBox.setPadding(dp(12), dp(12), dp(12), dp(24));
+        libraryScroll = new ScrollView(this);
+        libraryScroll.setBackgroundColor(BG);
+        libraryScroll.addView(libraryBox);
+        libraryScroll.setVisibility(View.GONE);
+        contentFrame.addView(libraryScroll, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        videosBox = new LinearLayout(this);
+        videosBox.setOrientation(LinearLayout.VERTICAL);
+        videosBox.setPadding(dp(12), dp(12), dp(12), dp(24));
+        videosScroll = new ScrollView(this);
+        videosScroll.setBackgroundColor(BG);
+        videosScroll.addView(videosBox);
+        videosScroll.setVisibility(View.GONE);
+        contentFrame.addView(videosScroll, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        buildNoticeCard();
+
+        // ---- barra inferior: histórico/fila | navegador | vídeos
+        LinearLayout bottom = new LinearLayout(this);
+        bottom.setOrientation(LinearLayout.HORIZONTAL);
+        bottom.setGravity(Gravity.CENTER);
+        bottom.setBackgroundColor(PANEL);
+        bottom.setPadding(dp(8), dp(8), dp(8), dp(8));
+
+        btnLibrary = circleButton(R.drawable.ic_menu);
+        btnBrowser = circleButton(R.drawable.ic_globe);
+        btnVideos = circleButton(R.drawable.ic_play);
+        btnLibrary.setOnClickListener(v -> showScreen(SCREEN_LIBRARY));
+        btnBrowser.setOnClickListener(v -> showScreen(SCREEN_BROWSER));
+        btnVideos.setOnClickListener(v -> showScreen(SCREEN_VIDEOS));
+
+        bottom.addView(weightWrap(btnLibrary), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        bottom.addView(weightWrap(btnBrowser), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        FrameLayout videoWrap = new FrameLayout(this);
+        videoWrap.addView(btnVideos, new FrameLayout.LayoutParams(dp(54), dp(54), Gravity.CENTER));
+        videoBadge = text("0", 11, BG, true);
+        videoBadge.setGravity(Gravity.CENTER);
+        videoBadge.setBackground(roundRect(PEACH, dp(10), null));
+        videoBadge.setVisibility(View.GONE);
+        FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER);
+        blp.leftMargin = dp(34);
+        blp.bottomMargin = dp(34);
+        videoWrap.addView(videoBadge, blp);
+        bottom.addView(videoWrap, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        main.addView(bottom, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        setContentView(outer);
+
+        Uri data = getIntent() == null ? null : getIntent().getData();
+        newTab(data != null ? data.toString() : HOME_URL, true);
+        showScreen(SCREEN_BROWSER);
+    }
+
+    private FrameLayout weightWrap(View v) {
+        FrameLayout f = new FrameLayout(this);
+        f.addView(v, new FrameLayout.LayoutParams(dp(54), dp(54), Gravity.CENTER));
+        return f;
+    }
+
+    private ImageView circleButton(int res) {
+        ImageView iv = icon(res, TEXT);
+        iv.setPadding(dp(14), dp(14), dp(14), dp(14));
+        iv.setBackground(roundRect(PANEL_LIGHT, dp(27), MUTED));
+        return iv;
+    }
+
+    private void showScreen(int s) {
+        screen = s;
+        if (panel != null && panel.isShowing()) panel.dismiss();
+        hideKeyboard();
+        webHolder.setVisibility(s == SCREEN_BROWSER ? View.VISIBLE : View.GONE);
+        libraryScroll.setVisibility(s == SCREEN_LIBRARY ? View.VISIBLE : View.GONE);
+        videosScroll.setVisibility(s == SCREEN_VIDEOS ? View.VISIBLE : View.GONE);
+        if (s == SCREEN_LIBRARY) buildLibrary();
+        if (s == SCREEN_VIDEOS) buildVideos();
+        btnLibrary.setBackground(roundRect(PANEL_LIGHT, dp(27), s == SCREEN_LIBRARY ? PEACH : MUTED));
+        btnBrowser.setBackground(roundRect(PANEL_LIGHT, dp(27), s == SCREEN_BROWSER ? PEACH : MUTED));
+        btnVideos.setBackground(roundRect(PANEL_LIGHT, dp(27), s == SCREEN_VIDEOS ? PEACH : MUTED));
+        hideNotice();
+    }
+
+    // ------------------------------------------------------------------ abas
+
+    private Tab cur() {
+        return current >= 0 && current < tabs.size() ? tabs.get(current) : null;
+    }
+
+    private void newTab(String url, boolean switchTo) {
+        Tab t = new Tab();
+        t.web = createWebView(t);
+        tabs.add(t);
+        if (switchTo) switchToTab(tabs.size() - 1);
+        t.lastTouch = SystemClock.uptimeMillis();
+        t.web.loadUrl(normalize(url));
+        updateTabsCount();
+    }
+
+    private void switchToTab(int index) {
+        if (index < 0 || index >= tabs.size()) return;
+        Tab old = cur();
+        if (old != null && old.web != null) {
+            old.web.onPause();
+            webHolder.removeView(old.web);
+        }
+        current = index;
+        Tab t = tabs.get(index);
+        webHolder.addView(t.web, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        t.web.onResume();
+        progressBar.setVisibility(View.INVISIBLE);
+        updateAddress();
+        refreshBadge();
+        updateTabsCount();
+        hideNotice();
+    }
+
+    private void closeTab(int index) {
+        if (index < 0 || index >= tabs.size()) return;
+        Tab t = tabs.get(index);
+        if (tabs.size() == 1) {
+            t.lastTouch = SystemClock.uptimeMillis();
+            t.web.loadUrl(HOME_URL);
+            return;
+        }
+        boolean wasCurrent = index == current;
+        if (wasCurrent) webHolder.removeView(t.web);
+        tabs.remove(index);
+        destroyWeb(t);
+        if (wasCurrent) {
+            current = -1;
+            switchToTab(Math.min(index, tabs.size() - 1));
+        } else if (index < current) {
+            current--;
+        }
+        updateTabsCount();
+    }
+
+    private void destroyWeb(Tab t) {
+        if (t == null || t.web == null) return;
+        try {
+            t.web.stopLoading();
+            t.web.removeJavascriptInterface("CastorBridge");
+            t.web.destroy();
+        } catch (Exception ignored) {
+        }
+        t.web = null;
+    }
+
+    private void updateTabsCount() {
+        if (tabsCount != null) tabsCount.setText(String.valueOf(tabs.size()));
+    }
+
+    private void showTabsDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(16), dp(8), dp(16), dp(8));
+        final AlertDialog[] dlg = new AlertDialog[1];
+        for (int i = 0; i < tabs.size(); i++) {
+            final int idx = i;
+            Tab t = tabs.get(i);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(12), dp(8), dp(4), dp(8));
+            row.setBackground(roundRect(idx == current ? PANEL_LIGHT : PANEL, dp(10), idx == current ? PEACH : null));
+            String name = isHome(t.url) || t.url.isEmpty() ? "Início"
+                    : (TextUtils.isEmpty(t.title) ? FilterEngine.hostOfUrl(t.url) : t.title);
+            TextView label = text(name, 14, TEXT, false);
+            label.setSingleLine(true);
+            label.setEllipsize(TextUtils.TruncateAt.END);
+            row.addView(label, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            ImageView close = icon(R.drawable.ic_close, MUTED);
+            close.setPadding(dp(10), dp(10), dp(10), dp(10));
+            close.setOnClickListener(v -> {
+                if (dlg[0] != null) dlg[0].dismiss();
+                closeTab(idx);
+                showScreen(SCREEN_BROWSER);
+            });
+            row.addView(close, new LinearLayout.LayoutParams(dp(40), dp(40)));
+            row.setOnClickListener(v -> {
+                if (dlg[0] != null) dlg[0].dismiss();
+                switchToTab(idx);
+                showScreen(SCREEN_BROWSER);
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = dp(8);
+            box.addView(row, lp);
+        }
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+        AlertDialog.Builder b = new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK);
+        b.setTitle("Abas (" + tabs.size() + ")");
+        b.setView(sv);
+        b.setPositiveButton("Nova aba", (d, w) -> {
+            newTab(HOME_URL, true);
+            showScreen(SCREEN_BROWSER);
+        });
+        b.setNegativeButton("Fechar", null);
+        dlg[0] = b.show();
+    }
+
+    // ------------------------------------------------------------------ WebView
+
+    private WebView createWebView(final Tab tab) {
+        WebView w = new WebView(this);
+        w.setBackgroundColor(BG);
+        WebSettings s = w.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setMediaPlaybackRequiresUserGesture(false);
+        s.setSupportMultipleWindows(true);
+        s.setJavaScriptCanOpenWindowsAutomatically(false);
+        s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+        s.setLoadWithOverviewMode(true);
+        s.setUseWideViewPort(true);
+        s.setBuiltInZoomControls(true);
+        s.setDisplayZoomControls(false);
+        s.setSupportZoom(true);
+        s.setAllowFileAccessFromFileURLs(false);
+        s.setAllowUniversalAccessFromFileURLs(false);
+        applyUserAgent(s);
+        CookieManager.getInstance().setAcceptCookie(true);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(w, true);
+        w.addJavascriptInterface(new Bridge(tab), "CastorBridge");
+        w.setOnTouchListener((v, e) -> {
+            tab.lastTouch = SystemClock.uptimeMillis();
+            return false;
+        });
+        w.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) -> {
+            if (mimeType != null && (mimeType.startsWith("video/") || mimeType.startsWith("audio/"))) {
+                addVideoForced(tab, url, mimeType.startsWith("audio/") ? "ÁUDIO" : "MP4");
+                ui.post(() -> Toast.makeText(this, "Vídeo detectado", Toast.LENGTH_SHORT).show());
+            }
+        });
+        w.setWebViewClient(new CastorClient(tab));
+        w.setWebChromeClient(new CastorChrome(tab));
+        return w;
+    }
+
+    private void applyUserAgent(WebSettings s) {
+        boolean desktop = store.desktop();
+        s.setUserAgentString(desktop ? USER_AGENT_DESKTOP : USER_AGENT_MOBILE);
+        s.setUseWideViewPort(true);
+        s.setLoadWithOverviewMode(true);
+    }
+
+    private final class CastorClient extends WebViewClient {
+        private final Tab tab;
+
+        CastorClient(Tab tab) {
+            this.tab = tab;
+        }
+
+        @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+            String url = req.getUrl().toString();
+            boolean blocked = false;
+            if (!req.isForMainFrame() && store.ads()) {
+                blocked = filters.shouldBlock(url, FilterEngine.hostOfUrl(tab.url));
+            }
+            if (blocked) {
+                tab.blockedCount++;
+                return emptyResponse();
+            }
+            if (isMediaUrl(url)) addVideo(tab, url);
+            return null;
+        }
+
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
+            return handleNavigation(tab, req.getUrl().toString(), req.hasGesture(), req.isForMainFrame());
+        }
+
+        @Override
+        public void onPageStarted(WebView view, String url, Bitmap favicon) {
+            if (!stripFragment(url).equals(stripFragment(tab.url))) tab.clearVideos();
+            tab.url = url;
+            tab.finished = false;
+            tab.title = "";
+            view.evaluateJavascript(castorJs, null);
+            if (tab == cur()) {
+                updateAddress();
+                refreshBadge();
+                progressBar.setVisibility(View.VISIBLE);
+            }
+        }
+
+        @Override
+        public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+            if (url != null && !url.equals(tab.url)) {
+                tab.url = url;
+                if (tab == cur()) updateAddress();
+            }
+        }
+
+        @Override
+        public void onPageFinished(WebView view, String url) {
+            tab.finished = true;
+            tab.url = url;
+            String title = view.getTitle();
+            if (title != null) tab.title = title;
+            view.evaluateJavascript(castorJs, null);
+            if (store.ads()) {
+                String css = "var s=document.createElement('style');s.textContent="
+                        + JSONObject.quote(FilterEngine.COSMETIC_CSS)
+                        + ";(document.head||document.documentElement).appendChild(s);";
+                view.evaluateJavascript("(function(){try{" + css + "}catch(e){}})();", null);
+            }
+            view.evaluateJavascript("window.__castorScan&&window.__castorScan(false)", null);
+            if (!isHome(url)) store.addHistory(url, tab.title);
+            if (tab == cur()) {
+                updateAddress();
+                progressBar.setVisibility(View.INVISIBLE);
+            }
+        }
+
+        @Override
+        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            handler.cancel();
+            ui.post(() -> Toast.makeText(MainActivity.this,
+                    "Certificado inválido: conexão bloqueada", Toast.LENGTH_LONG).show());
+        }
+
+        @Override
+        public void onReceivedError(WebView view, WebResourceRequest req, WebResourceError error) {
+            if (!req.isForMainFrame()) return;
+            String failing = req.getUrl().toString();
+            String html = "<html><body style='background:#171915;color:#fffaf2;font-family:sans-serif;padding:32px'>"
+                    + "<h2>Não foi possível carregar</h2><p style='color:#b3b4a6'>"
+                    + android.text.TextUtils.htmlEncode(failing)
+                    + "</p><p><a style='color:#f2ae86' href='" + android.text.TextUtils.htmlEncode(failing)
+                    + "'>Tentar novamente</a></p></body></html>";
+            view.loadDataWithBaseURL(failing, html, "text/html", "UTF-8", failing);
+        }
+    }
+
+    private final class CastorChrome extends WebChromeClient {
+        private final Tab tab;
+
+        CastorChrome(Tab tab) {
+            this.tab = tab;
+        }
+
+        @Override
+        public void onProgressChanged(WebView view, int newProgress) {
+            if (tab == cur()) {
+                progressBar.setProgress(newProgress);
+                progressBar.setVisibility(newProgress >= 100 ? View.INVISIBLE : View.VISIBLE);
+            }
+        }
+
+        @Override
+        public void onReceivedTitle(WebView view, String title) {
+            tab.title = title == null ? "" : title;
+        }
+
+        @Override
+        public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+            final WebView tmp = new WebView(MainActivity.this);
+            tmp.getSettings().setJavaScriptEnabled(true);
+            final boolean[] handled = {false};
+            tmp.setWebViewClient(new WebViewClient() {
+                private void capture(String u) {
+                    if (handled[0] || u == null || u.equals("about:blank")) return;
+                    handled[0] = true;
+                    ui.post(() -> {
+                        handlePopupUrl(tab, u, isUserGesture);
+                        try {
+                            tmp.stopLoading();
+                            tmp.destroy();
+                        } catch (Exception ignored) {
+                        }
+                    });
                 }
-            } catch (JSONException ignored) { }
+
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                    capture(r.getUrl().toString());
+                    return true;
+                }
+
+                @Override
+                public void onPageStarted(WebView v, String u, Bitmap f) {
+                    capture(u);
+                }
+
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                    capture(r.getUrl().toString());
+                    return emptyResponse();
+                }
+            });
+            ui.postDelayed(() -> {
+                if (!handled[0]) {
+                    handled[0] = true;
+                    try {
+                        tmp.destroy();
+                    } catch (Exception ignored) {
+                    }
+                }
+            }, 5000);
+            WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+            transport.setWebView(tmp);
+            resultMsg.sendToTarget();
+            return true;
+        }
+
+        @Override
+        public void onShowCustomView(View view, CustomViewCallback callback) {
+            if (customView != null) {
+                callback.onCustomViewHidden();
+                return;
+            }
+            customView = view;
+            customCallback = callback;
+            view.setBackgroundColor(Color.BLACK);
+            outer.addView(view, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            outer.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        }
+
+        @Override
+        public void onHideCustomView() {
+            hideCustomView();
+        }
+
+        @Override
+        public void onPermissionRequest(PermissionRequest request) {
+            request.deny();
+        }
+    }
+
+    private void hideCustomView() {
+        if (customView == null) return;
+        outer.removeView(customView);
+        outer.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+        customView = null;
+        if (customCallback != null) {
+            customCallback.onCustomViewHidden();
+            customCallback = null;
+        }
+    }
+
+    // ------------------------------------------------------------------ navegação e bloqueios
+
+    private boolean handleNavigation(Tab tab, String url, boolean gesture, boolean main) {
+        Uri uri = Uri.parse(url);
+        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
+        boolean userDriven = gesture || (SystemClock.uptimeMillis() - tab.lastTouch) < 1500;
+
+        if (scheme.equals("http") || scheme.equals("https")) {
+            if (!main) return false;
+            if (url.equals(tab.allowOnce)) {
+                tab.allowOnce = "";
+                return false;
+            }
+            if (!userDriven && tab.finished) {
+                if (store.redirect()) {
+                    String from = FilterEngine.hostOfUrl(tab.url);
+                    String to = FilterEngine.hostOfUrl(url);
+                    if (!FilterEngine.sameSite(from, to)) {
+                        showNotice(tab, "Redirecionamento bloqueado", url);
+                        return true;
+                    }
+                }
+            }
+            if (!userDriven && store.ads() && filters.shouldBlock(url, "")) {
+                showNotice(tab, "Anúncio bloqueado", url);
+                return true;
+            }
+            return false;
+        }
+        if (scheme.equals("about") || scheme.equals("javascript") || scheme.equals("data")
+                || scheme.equals("blob") || scheme.equals("file")) {
+            return false;
+        }
+        // esquemas externos: intent:, market:, deep links de apps...
+        if (!userDriven && store.redirect()) {
+            showNotice(tab, "Abertura de app bloqueada", url);
+            return true;
+        }
+        openExternal(url);
+        return true;
+    }
+
+    private void handlePopupUrl(Tab tab, String url, boolean gesture) {
+        if (url == null || url.isEmpty()) return;
+        if (!store.popup()) {
+            tab.allowOnce = url;
+            tab.lastTouch = SystemClock.uptimeMillis();
+            if (tab.web != null) tab.web.loadUrl(url);
+            return;
+        }
+        boolean sameSite = FilterEngine.sameSite(FilterEngine.hostOfUrl(url), FilterEngine.hostOfUrl(tab.url));
+        if (gesture && sameSite && !(store.ads() && filters.shouldBlock(url, ""))) {
+            newTab(url, true);
+            showScreen(SCREEN_BROWSER);
+            return;
+        }
+        showNotice(tab, "Pop-up bloqueado", url);
+    }
+
+    private void openExternal(String url) {
+        try {
+            Intent i;
+            if (url.startsWith("intent:")) {
+                i = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
+                i.setComponent(null);
+                i.setSelector(null);
+                i.addCategory(Intent.CATEGORY_BROWSABLE);
+            } else {
+                i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            }
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (ActivityNotFoundException | java.net.URISyntaxException e) {
+            Toast.makeText(this, "Nenhum app para abrir este link", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Não foi possível abrir", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private WebResourceResponse emptyResponse() {
+        return new WebResourceResponse("text/plain", "utf-8", 204, "Blocked",
+                new HashMap<String, String>(), new ByteArrayInputStream(new byte[0]));
+    }
+
+    // ------------------------------------------------------------------ aviso de bloqueio
+
+    private void buildNoticeCard() {
+        noticeCard = new LinearLayout(this);
+        noticeCard.setOrientation(LinearLayout.VERTICAL);
+        noticeCard.setBackground(roundRect(PANEL, dp(14), PEACH));
+        noticeCard.setPadding(dp(14), dp(10), dp(14), dp(10));
+        noticeCard.setVisibility(View.GONE);
+        noticeCard.setElevation(dp(8));
+
+        noticeReason = text("", 13, PEACH, true);
+        noticeCard.addView(noticeReason);
+
+        noticeUrl = text("", 12, TEXT, false);
+        noticeUrl.setMaxLines(2);
+        noticeUrl.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        noticeUrl.setPadding(0, dp(2), 0, dp(6));
+        noticeCard.addView(noticeUrl);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.END);
+        Button ignore = button("Ignorar", PANEL_LIGHT, TEXT);
+        Button open = button("Abrir", PEACH, BG);
+        ignore.setOnClickListener(v -> hideNotice());
+        open.setOnClickListener(v -> {
+            String target = noticeTarget;
+            Tab t = noticeTab;
+            hideNotice();
+            if (target.isEmpty()) return;
+            if (target.startsWith("http://") || target.startsWith("https://")) {
+                if (t != null && t.web != null) {
+                    t.allowOnce = target;
+                    t.lastTouch = SystemClock.uptimeMillis();
+                    t.web.loadUrl(target);
+                }
+            } else {
+                openExternal(target);
+            }
+        });
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(dp(96), dp(38));
+        blp.leftMargin = dp(8);
+        row.addView(ignore, blp);
+        row.addView(open, blp);
+        noticeCard.addView(row);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
+        lp.setMargins(dp(10), dp(10), dp(10), dp(10));
+        contentFrame.addView(noticeCard, lp);
+    }
+
+    private void showNotice(Tab tab, String reason, String url) {
+        ui.post(() -> {
+            if (tab != cur() || screen != SCREEN_BROWSER || noticeCard == null) return;
+            noticeTab = tab;
+            noticeTarget = url;
+            noticeReason.setText(reason);
+            noticeUrl.setText(url);
+            noticeCard.setVisibility(View.VISIBLE);
+            if (noticeHide != null) ui.removeCallbacks(noticeHide);
+            int secs = store.noticeSeconds();
+            if (secs > 0) {
+                noticeHide = this::hideNotice;
+                ui.postDelayed(noticeHide, secs * 1000L);
+            }
+        });
+    }
+
+    private void hideNotice() {
+        if (noticeHide != null) ui.removeCallbacks(noticeHide);
+        if (noticeCard != null) noticeCard.setVisibility(View.GONE);
+    }
+
+    // ------------------------------------------------------------------ vídeos
+
+    private static final class Ext {
+        static String typeOf(String url) {
+            if (url == null) return "";
+            String u = url.toLowerCase(Locale.ROOT);
+            int q = u.indexOf('?');
+            int h = u.indexOf('#');
+            int end = u.length();
+            if (q >= 0) end = Math.min(end, q);
+            if (h >= 0) end = Math.min(end, h);
+            String path = u.substring(0, end);
+            if (path.endsWith(".m3u8")) return "HLS";
+            if (path.endsWith(".mpd")) return "DASH";
+            if (path.endsWith(".mp4")) return "MP4";
+            if (path.endsWith(".webm")) return "WEBM";
+            if (path.endsWith(".m4v")) return "M4V";
+            if (path.endsWith(".mov")) return "MOV";
+            if (path.endsWith(".mkv")) return "MKV";
+            if (path.endsWith(".flv")) return "FLV";
+            if (path.endsWith(".mp3") || path.endsWith(".m4a") || path.endsWith(".ogg") || path.endsWith(".wav")) {
+                return "ÁUDIO";
+            }
+            return "";
+        }
+    }
+
+    private boolean isMediaUrl(String url) {
+        if (url == null) return false;
+        String l = url.toLowerCase(Locale.ROOT);
+        if (!(l.startsWith("http://") || l.startsWith("https://"))) return false;
+        return !Ext.typeOf(url).isEmpty();
+    }
+
+    private void addVideo(Tab tab, String url) {
+        String type = Ext.typeOf(url);
+        if (type.isEmpty()) return;
+        addVideoForced(tab, url, type);
+    }
+
+    private void addVideoForced(Tab tab, String url, String type) {
+        if (url == null || !url.startsWith("http")) return;
+        if (store.ads() && filters.shouldBlock(url, FilterEngine.hostOfUrl(tab.url))) return;
+        String page = TextUtils.isEmpty(tab.title) ? FilterEngine.hostOfUrl(tab.url) : tab.title;
+        MediaItem m = new MediaItem(url, page + " · " + fileName(url), tab.url, tab.url, type);
+        if (tab.addVideo(m)) ui.post(this::refreshBadge);
+    }
+
+    private void addFrame(Tab tab, String url) {
+        if (store.ads() && filters.shouldBlock(url, FilterEngine.hostOfUrl(tab.url))) return;
+        MediaItem m = new MediaItem(url, "Player embutido · " + FilterEngine.hostOfUrl(url), tab.url, tab.url, "PÁGINA");
+        if (tab.addVideo(m)) ui.post(this::refreshBadge);
+    }
+
+    private String fileName(String url) {
+        try {
+            String seg = Uri.parse(url).getLastPathSegment();
+            if (seg == null || seg.isEmpty()) return "vídeo";
+            seg = Uri.decode(seg);
+            return seg.length() > 50 ? seg.substring(0, 47) + "…" : seg;
+        } catch (Exception e) {
+            return "vídeo";
+        }
+    }
+
+    private void refreshBadge() {
+        if (videoBadge == null) return;
+        Tab t = cur();
+        int n = t == null ? 0 : t.videoCount();
+        videoBadge.setText(n > 99 ? "99+" : String.valueOf(n));
+        videoBadge.setVisibility(n > 0 ? View.VISIBLE : View.GONE);
+        if (screen == SCREEN_VIDEOS && videosScroll != null) buildVideos();
+    }
+
+    private final class Bridge {
+        private final Tab tab;
+
+        Bridge(Tab tab) {
+            this.tab = tab;
         }
 
         @JavascriptInterface
-        public void onBlobMedia() { blobVideoDetected = true; }
+        public void onMedia(String json) {
+            try {
+                JSONArray a = new JSONArray(json);
+                for (int i = 0; i < a.length() && i < 200; i++) addVideo(tab, a.getString(i));
+            } catch (JSONException ignored) {
+            }
+        }
+
+        @JavascriptInterface
+        public void onFrames(String json) {
+            try {
+                JSONArray a = new JSONArray(json);
+                for (int i = 0; i < a.length() && i < 30; i++) addFrame(tab, a.getString(i));
+            } catch (JSONException ignored) {
+            }
+        }
+
+        @JavascriptInterface
+        public void onBlob() {
+            tab.blobSeen = true;
+        }
+
+        @JavascriptInterface
+        public boolean popupBlocked() {
+            return store.popup();
+        }
 
         @JavascriptInterface
         public void onPopup(String url) {
-            mainHandler.post(() -> handlePopupRequest(url));
+            ui.post(() -> handlePopupUrl(tab, url, false));
+        }
+
+        @JavascriptInterface
+        public void onScanDone(int media, int frames) {
+            ui.post(() -> {
+                String msg = media > 0 ? media + " vídeo(s) encontrados"
+                        : (frames > 0 ? "Nenhum link direto; veja os players embutidos" : "Nenhum vídeo encontrado nesta página");
+                Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show();
+                refreshBadge();
+            });
         }
     }
 
-    private static final class VideoItem {
-        final String url;
-        final String title;
-        final String source;
-        VideoItem(String url, String title, String source) {
-            this.url = url;
-            this.title = title;
-            this.source = source;
+    private void forceSearch() {
+        Tab t = cur();
+        if (t == null || t.web == null) return;
+        Toast.makeText(this, "Procurando vídeos na página…", Toast.LENGTH_SHORT).show();
+        t.web.evaluateJavascript("window.__castorScan&&window.__castorScan(true)", null);
+        ui.postDelayed(() -> showScreen(SCREEN_VIDEOS), 2300);
+    }
+
+    private void play(List<MediaItem> list, int index) {
+        if (list.isEmpty()) return;
+        Intent i = new Intent(this, PlayerActivity.class);
+        i.putExtra(PlayerActivity.EXTRA_ITEMS, Store.queueToJson(list));
+        i.putExtra(PlayerActivity.EXTRA_INDEX, index);
+        startActivity(i);
+    }
+
+    // ------------------------------------------------------------------ tela: vídeos do site
+
+    private void buildVideos() {
+        videosBox.removeAllViews();
+        Tab t = cur();
+        List<MediaItem> list = t == null ? new ArrayList<MediaItem>() : t.videoList();
+
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = text("Vídeos neste site (" + list.size() + ")", 17, TEXT, true);
+        head.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Button force = button("Force search", PEACH, BG);
+        force.setOnClickListener(v -> forceSearch());
+        head.addView(force, new LinearLayout.LayoutParams(dp(130), dp(40)));
+        videosBox.addView(head);
+
+        if (t != null && !t.url.isEmpty() && !isHome(t.url)) {
+            TextView host = text(FilterEngine.hostOfUrl(t.url), 12, MUTED, false);
+            host.setPadding(0, dp(4), 0, dp(8));
+            videosBox.addView(host);
         }
+
+        if (t != null && t.blobSeen) {
+            TextView info = text("Esta página usa vídeo em formato protegido/blob. Nem sempre existe um link direto.", 12, GREEN, false);
+            info.setPadding(0, 0, 0, dp(8));
+            videosBox.addView(info);
+        }
+
+        if (list.isEmpty()) {
+            TextView empty = text("Nenhum vídeo encontrado ainda. Toque play na página e depois em Force search.", 14, MUTED, false);
+            empty.setPadding(0, dp(24), 0, 0);
+            videosBox.addView(empty);
+            return;
+        }
+
+        List<MediaItem> playable = new ArrayList<>();
+        for (MediaItem m : list) if (!m.type.equals("PÁGINA")) playable.add(m);
+
+        if (playable.size() > 1) {
+            Button all = button("▶  Reproduzir todos em fila (" + playable.size() + ")", PANEL_LIGHT, TEXT);
+            all.setOnClickListener(v -> play(playable, 0));
+            LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+            alp.bottomMargin = dp(10);
+            videosBox.addView(all, alp);
+        }
+
+        for (final MediaItem m : list) {
+            LinearLayout card = card();
+            LinearLayout line = new LinearLayout(this);
+            line.setOrientation(LinearLayout.HORIZONTAL);
+            line.setGravity(Gravity.CENTER_VERTICAL);
+            TextView tag = text(m.type, 11, BG, true);
+            tag.setGravity(Gravity.CENTER);
+            tag.setBackground(roundRect(m.type.equals("PÁGINA") ? GREEN : PEACH, dp(6), null));
+            tag.setPadding(dp(8), dp(2), dp(8), dp(2));
+            line.addView(tag);
+            TextView name = text(m.title, 13, TEXT, true);
+            name.setSingleLine(true);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            name.setPadding(dp(8), 0, 0, 0);
+            line.addView(name, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            card.addView(line);
+
+            TextView u = text(m.url, 11, MUTED, false);
+            u.setMaxLines(2);
+            u.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            u.setPadding(0, dp(4), 0, dp(8));
+            card.addView(u);
+
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            if (m.type.equals("PÁGINA")) {
+                Button open = button("Abrir player", PEACH, BG);
+                open.setOnClickListener(v -> {
+                    Tab ct = cur();
+                    if (ct != null) {
+                        ct.allowOnce = m.url;
+                        ct.lastTouch = SystemClock.uptimeMillis();
+                        ct.web.loadUrl(m.url);
+                    }
+                    showScreen(SCREEN_BROWSER);
+                });
+                actions.addView(open, actionParams());
+            } else {
+                Button playBtn = button("Reproduzir", PEACH, BG);
+                playBtn.setOnClickListener(v -> {
+                    List<MediaItem> one = new ArrayList<>();
+                    one.add(m);
+                    play(one, 0);
+                });
+                actions.addView(playBtn, actionParams());
+                Button queue = button("+ Fila", PANEL_LIGHT, TEXT);
+                queue.setOnClickListener(v -> {
+                    boolean added = store.addToQueue(m);
+                    Toast.makeText(this, added ? "Adicionado à fila" : "Já está na fila", Toast.LENGTH_SHORT).show();
+                });
+                actions.addView(queue, actionParams());
+            }
+            Button more = button("⋯", PANEL_LIGHT, TEXT);
+            more.setOnClickListener(v -> showVideoMenu(m));
+            actions.addView(more, new LinearLayout.LayoutParams(dp(48), dp(38)));
+            card.addView(actions);
+            videosBox.addView(card);
+        }
+    }
+
+    private LinearLayout.LayoutParams actionParams() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+        lp.rightMargin = dp(8);
+        return lp;
+    }
+
+    private void showVideoMenu(final MediaItem m) {
+        String[] items = {"Copiar link", "Compartilhar link", "Abrir em outro app"};
+        new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle(m.type)
+                .setItems(items, (d, which) -> {
+                    if (which == 0) {
+                        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                        if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("vídeo", m.url));
+                        Toast.makeText(this, "Link copiado", Toast.LENGTH_SHORT).show();
+                    } else if (which == 1) {
+                        Intent s = new Intent(Intent.ACTION_SEND);
+                        s.setType("text/plain");
+                        s.putExtra(Intent.EXTRA_TEXT, m.url);
+                        startActivity(Intent.createChooser(s, "Compartilhar"));
+                    } else {
+                        try {
+                            Intent v = new Intent(Intent.ACTION_VIEW);
+                            v.setDataAndType(Uri.parse(m.url), m.type.equals("HLS") ? "application/x-mpegURL"
+                                    : (m.type.equals("DASH") ? "application/dash+xml" : "video/*"));
+                            startActivity(Intent.createChooser(v, "Abrir com"));
+                        } catch (Exception e) {
+                            Toast.makeText(this, "Nenhum app compatível", Toast.LENGTH_SHORT).show();
+                        }
+                    }
+                })
+                .show();
+    }
+
+    // ------------------------------------------------------------------ tela: histórico e fila
+
+    private void buildLibrary() {
+        libraryBox.removeAllViews();
+
+        LinearLayout seg = new LinearLayout(this);
+        seg.setOrientation(LinearLayout.HORIZONTAL);
+        Button bq = button("Fila", libraryTab == 0 ? PEACH : PANEL_LIGHT, libraryTab == 0 ? BG : TEXT);
+        Button bh = button("Histórico", libraryTab == 1 ? PEACH : PANEL_LIGHT, libraryTab == 1 ? BG : TEXT);
+        bq.setOnClickListener(v -> {
+            libraryTab = 0;
+            buildLibrary();
+        });
+        bh.setOnClickListener(v -> {
+            libraryTab = 1;
+            buildLibrary();
+        });
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(0, dp(42), 1f);
+        sp.rightMargin = dp(8);
+        seg.addView(bq, sp);
+        seg.addView(bh, new LinearLayout.LayoutParams(0, dp(42), 1f));
+        LinearLayout.LayoutParams segLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        segLp.bottomMargin = dp(12);
+        libraryBox.addView(seg, segLp);
+
+        if (libraryTab == 0) buildQueueList();
+        else buildHistoryList();
+    }
+
+    private void buildQueueList() {
+        final List<MediaItem> q = store.queue();
+        TextView title = text("Fila de reprodução (" + q.size() + ")", 16, TEXT, true);
+        title.setPadding(0, 0, 0, dp(8));
+        libraryBox.addView(title);
+
+        if (q.isEmpty()) {
+            libraryBox.addView(text("A fila está vazia. Em “Vídeos”, toque em + Fila.", 14, MUTED, false));
+            return;
+        }
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        Button playAll = button("▶  Reproduzir fila", PEACH, BG);
+        Button clear = button("Limpar", PANEL_LIGHT, TEXT);
+        playAll.setOnClickListener(v -> play(q, 0));
+        clear.setOnClickListener(v -> {
+            store.clearQueue();
+            buildLibrary();
+        });
+        LinearLayout.LayoutParams a1 = new LinearLayout.LayoutParams(0, dp(42), 1f);
+        a1.rightMargin = dp(8);
+        actions.addView(playAll, a1);
+        actions.addView(clear, new LinearLayout.LayoutParams(dp(100), dp(42)));
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        alp.bottomMargin = dp(10);
+        libraryBox.addView(actions, alp);
+
+        for (int i = 0; i < q.size(); i++) {
+            final int idx = i;
+            final MediaItem m = q.get(i);
+            LinearLayout card = card();
+            LinearLayout line = new LinearLayout(this);
+            line.setOrientation(LinearLayout.HORIZONTAL);
+            line.setGravity(Gravity.CENTER_VERTICAL);
+            TextView num = text(String.valueOf(i + 1), 13, PEACH, true);
+            num.setPadding(0, 0, dp(10), 0);
+            line.addView(num);
+            LinearLayout info = new LinearLayout(this);
+            info.setOrientation(LinearLayout.VERTICAL);
+            TextView name = text(m.title, 13, TEXT, true);
+            name.setSingleLine(true);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            info.addView(name);
+            TextView host = text(m.type + " · " + FilterEngine.hostOfUrl(m.url), 11, MUTED, false);
+            host.setSingleLine(true);
+            info.addView(host);
+            line.addView(info, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            ImageView playIcon = icon(R.drawable.ic_play, PEACH);
+            playIcon.setPadding(dp(8), dp(8), dp(8), dp(8));
+            playIcon.setOnClickListener(v -> play(q, idx));
+            line.addView(playIcon, new LinearLayout.LayoutParams(dp(40), dp(40)));
+            ImageView del = icon(R.drawable.ic_close, MUTED);
+            del.setPadding(dp(10), dp(10), dp(10), dp(10));
+            del.setOnClickListener(v -> {
+                store.removeFromQueue(idx);
+                buildLibrary();
+            });
+            line.addView(del, new LinearLayout.LayoutParams(dp(40), dp(40)));
+            card.addView(line);
+            libraryBox.addView(card);
+        }
+    }
+
+    private void buildHistoryList() {
+        List<String[]> hist = store.history();
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        head.addView(text("Histórico (" + hist.size() + ")", 16, TEXT, true),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        if (!hist.isEmpty()) {
+            Button clear = button("Limpar", PANEL_LIGHT, TEXT);
+            clear.setOnClickListener(v -> {
+                store.clearHistory();
+                buildLibrary();
+            });
+            head.addView(clear, new LinearLayout.LayoutParams(dp(100), dp(38)));
+        }
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hlp.bottomMargin = dp(8);
+        libraryBox.addView(head, hlp);
+
+        if (hist.isEmpty()) {
+            libraryBox.addView(text("Nenhuma página visitada ainda.", 14, MUTED, false));
+            return;
+        }
+        for (final String[] h : hist) {
+            LinearLayout card = card();
+            TextView name = text(h[1].isEmpty() ? FilterEngine.hostOfUrl(h[0]) : h[1], 13, TEXT, true);
+            name.setSingleLine(true);
+            name.setEllipsize(TextUtils.TruncateAt.END);
+            card.addView(name);
+            TextView u = text(h[0], 11, MUTED, false);
+            u.setSingleLine(true);
+            u.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            card.addView(u);
+            card.setOnClickListener(v -> {
+                Tab t = cur();
+                if (t != null) {
+                    t.lastTouch = SystemClock.uptimeMillis();
+                    t.web.loadUrl(h[0]);
+                }
+                showScreen(SCREEN_BROWSER);
+            });
+            libraryBox.addView(card);
+        }
+    }
+
+    // ------------------------------------------------------------------ painel Block ADS
+
+    private void showBlockPanel(View anchor) {
+        if (panel != null && panel.isShowing()) {
+            panel.dismiss();
+            return;
+        }
+        Tab t = cur();
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(roundRect(PANEL, dp(16), MUTED));
+        box.setPadding(dp(16), dp(14), dp(16), dp(14));
+
+        LinearLayout titleRow = new LinearLayout(this);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        titleRow.addView(text("Block ADS", 17, TEXT, true),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        int n = t == null ? 0 : t.blockedCount;
+        titleRow.addView(text(n + " bloqueados", 12, GREEN, false));
+        box.addView(titleRow);
+
+        box.addView(switchRow("Popup", store.popup(), (b, on) -> store.setPopup(on)));
+        box.addView(switchRow("Redirect", store.redirect(), (b, on) -> store.setRedirect(on)));
+        box.addView(switchRow("Ads", store.ads(), (b, on) -> store.setAds(on)));
+
+        View line = new View(this);
+        line.setBackgroundColor(PANEL_LIGHT);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        llp.topMargin = dp(10);
+        llp.bottomMargin = dp(10);
+        box.addView(line, llp);
+
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+        bottomRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        Button force = button("Force search", PEACH, BG);
+        force.setOnClickListener(v -> {
+            if (panel != null) panel.dismiss();
+            forceSearch();
+        });
+        left.addView(force, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+        final Button desktop = button(store.desktop() ? "Modo desktop: ligado" : "Modo desktop: desligado", PANEL_LIGHT, TEXT);
+        desktop.setOnClickListener(v -> {
+            store.setDesktop(!store.desktop());
+            for (Tab tb : tabs) if (tb.web != null) applyUserAgent(tb.web.getSettings());
+            if (panel != null) panel.dismiss();
+            Tab ct = cur();
+            if (ct != null && ct.web != null) ct.web.reload();
+        });
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40));
+        dlp.topMargin = dp(8);
+        left.addView(desktop, dlp);
+        bottomRow.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        LinearLayout right = new LinearLayout(this);
+        right.setOrientation(LinearLayout.VERTICAL);
+        right.setGravity(Gravity.CENTER);
+        ImageView more = icon(R.drawable.ic_gear, PEACH);
+        more.setPadding(dp(10), dp(10), dp(10), dp(10));
+        more.setBackground(roundRect(PANEL_LIGHT, dp(24), PEACH));
+        more.setOnClickListener(v -> {
+            if (panel != null) panel.dismiss();
+            showSettingsDialog();
+        });
+        right.addView(more, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        TextView moreLabel = text("Mais\nconfig.", 10, MUTED, false);
+        moreLabel.setGravity(Gravity.CENTER);
+        right.addView(moreLabel);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.WRAP_CONTENT);
+        rlp.leftMargin = dp(10);
+        bottomRow.addView(right, rlp);
+        box.addView(bottomRow);
+
+        int w = dp(300);
+        panel = new PopupWindow(box, w, ViewGroup.LayoutParams.WRAP_CONTENT, true);
+        panel.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        panel.setOutsideTouchable(true);
+        panel.setElevation(dp(10));
+        panel.showAsDropDown(anchor, -(w - anchor.getWidth()), dp(6));
+    }
+
+    private View switchRow(String label, boolean checked, CompoundButton.OnCheckedChangeListener l) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(6), 0, dp(2));
+        row.addView(text(label, 15, TEXT, false), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Switch sw = new Switch(this);
+        sw.setChecked(checked);
+        sw.setOnCheckedChangeListener(l);
+        row.addView(sw);
+        return row;
+    }
+
+    // ------------------------------------------------------------------ configurações
+
+    private void showSettingsDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), dp(8));
+
+        box.addView(text("Tempo do aviso de bloqueio", 14, TEXT, true));
+        final TextView secLabel = text(secondsText(store.noticeSeconds()), 13, MUTED, false);
+        box.addView(secLabel);
+        SeekBar sb = new SeekBar(this);
+        sb.setMax(15);
+        sb.setProgress(store.noticeSeconds());
+        sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                store.setNoticeSeconds(progress);
+                secLabel.setText(secondsText(progress));
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+        box.addView(sb);
+
+        final TextView filterInfo = text("Regras de bloqueio carregadas: " + filters.size(), 12, MUTED, false);
+        filterInfo.setPadding(0, dp(16), 0, dp(4));
+        box.addView(filterInfo);
+        Button upd = button("Atualizar listas de bloqueio", PANEL_LIGHT, TEXT);
+        upd.setOnClickListener(v -> {
+            Toast.makeText(this, "Atualizando listas…", Toast.LENGTH_SHORT).show();
+            io.execute(() -> {
+                boolean ok = filters.download(getApplicationContext());
+                if (ok) store.setFilterTime(System.currentTimeMillis());
+                ui.post(() -> {
+                    filterInfo.setText("Regras de bloqueio carregadas: " + filters.size());
+                    Toast.makeText(this, ok ? "Listas atualizadas" : "Sem conexão com as listas", Toast.LENGTH_SHORT).show();
+                });
+            });
+        });
+        box.addView(upd, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)));
+
+        Button clearData = button("Limpar cookies e dados de sites", PANEL_LIGHT, TEXT);
+        clearData.setOnClickListener(v -> {
+            CookieManager.getInstance().removeAllCookies(null);
+            WebStorage.getInstance().deleteAllData();
+            Tab t = cur();
+            if (t != null && t.web != null) t.web.clearCache(true);
+            Toast.makeText(this, "Dados limpos", Toast.LENGTH_SHORT).show();
+        });
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+        clp.topMargin = dp(8);
+        box.addView(clearData, clp);
+
+        Button clearHist = button("Limpar histórico", PANEL_LIGHT, TEXT);
+        clearHist.setOnClickListener(v -> {
+            store.clearHistory();
+            Toast.makeText(this, "Histórico limpo", Toast.LENGTH_SHORT).show();
+        });
+        box.addView(clearHist, clp);
+
+        TextView about = text("Castor 2.0 · Detecta links diretos (MP4, HLS, DASH…). Não contorna DRM.", 11, MUTED, false);
+        about.setPadding(0, dp(16), 0, 0);
+        box.addView(about);
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box);
+        new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle("Configurações")
+                .setView(sv)
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
+    private String secondsText(int s) {
+        return s == 0 ? "Fica na tela até você escolher" : "Some após " + s + " s";
+    }
+
+    // ------------------------------------------------------------------ endereço
+
+    private void goFromField() {
+        String in = urlField.getText().toString();
+        Tab t = cur();
+        if (t == null) return;
+        t.lastTouch = SystemClock.uptimeMillis();
+        t.web.loadUrl(normalize(in));
+        hideKeyboard();
+        urlField.clearFocus();
+        showScreen(SCREEN_BROWSER);
+    }
+
+    private String normalize(String input) {
+        String s = input == null ? "" : input.trim();
+        if (s.isEmpty()) return HOME_URL;
+        if (s.startsWith("http://") || s.startsWith("https://") || s.startsWith("file:///android_asset/")) return s;
+        if (s.equals("localhost") || s.startsWith("localhost:")) return "http://" + s;
+        if (!s.contains(" ") && s.contains(".") && !s.endsWith(".")) return "https://" + s;
+        return "https://www.google.com/search?q=" + Uri.encode(s);
+    }
+
+    private void updateAddress() {
+        Tab t = cur();
+        if (t == null || urlField == null) return;
+        if (urlField.hasFocus()) return;
+        urlField.setText(isHome(t.url) ? "" : t.url);
+    }
+
+    private boolean isHome(String url) {
+        return url == null || url.startsWith("file:///android_asset/");
+    }
+
+    private static String stripFragment(String url) {
+        if (url == null) return "";
+        int i = url.indexOf('#');
+        return i >= 0 ? url.substring(0, i) : url;
+    }
+
+    private void hideKeyboard() {
+        try {
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            View v = getCurrentFocus();
+            if (imm != null && v != null) imm.hideSoftInputFromWindow(v.getWindowToken(), 0);
+        } catch (Exception ignored) {
+        }
+    }
+
+    // ------------------------------------------------------------------ utilidades de UI
+
+    private String readAsset(String name) {
+        try (InputStream in = getAssets().open(name)) {
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+            return bo.toString("UTF-8");
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private LinearLayout card() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setBackground(roundRect(PANEL, dp(12), null));
+        c.setPadding(dp(12), dp(10), dp(12), dp(10));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(8);
+        c.setLayoutParams(lp);
+        return c;
+    }
+
+    private ImageView icon(int res, int tint) {
+        ImageView iv = new ImageView(this);
+        iv.setImageResource(res);
+        iv.setColorFilter(tint);
+        iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        return iv;
+    }
+
+    private TextView text(String value, float sp, int color, boolean bold) {
+        TextView t = new TextView(this);
+        t.setText(value);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+        return t;
+    }
+
+    private Button button(String label, int background, int foreground) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setTextSize(13);
+        b.setTextColor(foreground);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setBackground(roundRect(background, dp(20), null));
+        b.setPadding(dp(10), 0, dp(10), 0);
+        b.setMinHeight(0);
+        b.setMinWidth(0);
+        return b;
+    }
+
+    private GradientDrawable roundRect(int color, int radius, Integer stroke) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(radius);
+        if (stroke != null) g.setStroke(dp(2), stroke);
+        return g;
+    }
+
+    private int dp(float v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
     }
 }

@@ -1,36 +1,33 @@
-# Castor Android browser — build and behavior
+# Castor Android Browser 2.0
 
-This Android client is a native WebView browser that uses the Castor icon supplied for this build. It boots directly into the browser: the only setup stages shown are **“Baixando ambiente”** and **“Iniciando”**. It downloads EasyList and EasyPrivacy filter rules on first launch (and refreshes them roughly once a day), caches them in the app-private directory, and falls back to bundled rules if the device is offline.
+Navegador Android (Java + WebView + Media3/ExoPlayer) com detecção de vídeos, fila de reprodução e bloqueio de anúncios, pop-ups e redirecionamentos.
 
-## Included in this Android build
+## Interface (baseada no desenho)
 
-- Web browser with address/search field, back, forward, home, refresh and a page-media action.
-- Media URL detection for direct MP4, M3U8/HLS, MPD/DASH, WebM, M4V, MOV, MKV, TS, FLV and common audio URLs found in HTML video/source elements, links and browser resource entries.
-- Media action list with URL, detected format, opening in a compatible Android app, copy and share actions.
-- Ad/tracker blocking with built-in domain rules plus downloaded EasyList/EasyPrivacy rules where their common domain/path syntax is supported.
-- Popup and automatic-redirect controls, all **enabled by default**.
-- Compact blocking notice showing the URL and **“Abrir” / “Ignorar”** actions. By default the notice closes after 3 seconds. Settings allow 0 seconds (stay until a choice) or a timeout from 1 to 15 seconds.
-- User-facing configuration is limited to the protection toggles and timeout; no server URL/setup screen is shown.
-- App launcher icon is generated from the provided `castor.svg` image.
+- **Barra superior:** endereço/pesquisa · contador de abas (abre o seletor de abas) · engrenagem (painel *Block ADS*).
+- **Barra inferior:** ☰ histórico + fila · 🌐 navegador · ▶ vídeos encontrados no site (com contador).
+- **Painel Block ADS:** chaves *Popup*, *Redirect* e *Ads* (todas ligadas por padrão), botão **Force search** (força a busca de vídeos na página), modo desktop e engrenagem de **mais configurações**.
+- **Página inicial** com atalhos de serviços (Google, YouTube, Prime Video etc.).
+- **Aviso de bloqueio:** mostra o link com **Abrir** / **Ignorar**; some em 3 s (configurável de 0 a 15 s; 0 = fica até escolher).
 
-## Important limitation: the Castor server is not embedded yet
+## Como compilar no GitHub
 
-This is **not** a full Android port of every Castor backend component. The app currently starts its local browser/filter runtime; it does not start the original Go `castor api-server`, `media-server` and `scraping-server` processes. Upstream Castor's page extraction requires headless Chrome/Chromium and its media processing requires FFmpeg/FFprobe 7.1+; the upstream Linux release binary is not an Android runtime, and the scraping path cannot be assumed to work inside Android WebView. Properly embedding those services needs a separately tested Android-compatible build of the Go backend, media toolchain and browser extractor. The app does not pretend that stage has completed.
+1. Copie `android/`, `.github/workflows/build-android-apk.yml` e este arquivo para a raiz do repositório e faça commit.
+2. Vá em **Actions → Build Castor Android APK → Run workflow**.
+3. Ao terminar, baixe o artefato `castor-android-debug-apk` e instale o `castor-android-debug.apk`.
 
-The media detector extracts direct URLs exposed to WebView. It cannot guarantee Web Video Caster-level compatibility: DRM-protected playback, encrypted/obfuscated site APIs, `blob:` media that has no accessible direct URL, signed/expiring links and site-specific playback flows may require an additional extractor. This build does not bypass DRM or site access controls. For supported direct URLs, the Android app opens a compatible media player where available; MP4 and HLS support depends on the installed player/device.
+Requisitos do build: JDK 17, Gradle 8.13, Android SDK 36 (o workflow já configura tudo).
 
-## Build an APK with GitHub Actions
+## Como funciona
 
-1. Push this repository to GitHub, including `android/` and `.github/workflows/build-android-apk.yml`.
-2. Open **Actions → Build Castor Android APK → Run workflow** (or push a change inside `android/`).
-3. When the job finishes, download the `castor-android-debug-apk` artifact, extract `castor-android-debug.apk`, and install it on Android.
+- **Detecção de vídeo:** intercepta as requisições da WebView e varre a página (tags video/source, links, meta og:video, scripts, iframes do mesmo domínio). Reconhece MP4, HLS (m3u8), DASH (mpd), WebM, MKV, MOV, FLV e áudio.
+- **Force search:** varre a página de novo, tenta iniciar os players em mudo para revelar a fonte e lista players embutidos (iframes de outro domínio) para você abrir.
+- **Player interno:** ExoPlayer com fila, próximo/anterior, envia Referer da página original e entra em picture-in-picture.
+- **Bloqueio:** domínios de anúncios/rastreadores (lista embutida + regras `||dominio^` do EasyList/EasyPrivacy baixadas na primeira abertura e atualizadas a cada 24 h), CSS cosmético, bloqueio de `window.open`/pop-ups, de redirecionamentos sem toque do usuário para outro site e de abertura automática de apps.
 
-The workflow builds a debug APK using JDK 17, Gradle 8.13 and Android SDK 36. Debug APKs are not release-signed.
+## Limitações conhecidas
 
-## Privacy and network
-
-Filter lists are downloaded from `easylist.to` over HTTPS. URLs visited by the user are loaded in Android WebView. Filter rules are stored inside the app-private storage; no account is required. Clear the app's storage to erase those cached rules and browser state. The browser blocks invalid HTTPS certificates and does not bypass DRM.
-
-## License
-
-The upstream Castor source remains under its existing MIT license. This Android client layer does not change the upstream license or the source's content/access limitations.
+- Não contorna DRM. Sites como Prime Video/Netflix e vídeos `blob:` sem link direto não podem ser extraídos.
+- O servidor Go original do Castor (api/media/scraping, Chromium e FFmpeg) **não** roda dentro do app; transmissão para dispositivos (cast) não está incluída.
+- Gera APK de depuração (sem assinatura de release).
+- O código foi escrito sem compilar neste ambiente: se o build do GitHub acusar erro, envie o log para correção.
