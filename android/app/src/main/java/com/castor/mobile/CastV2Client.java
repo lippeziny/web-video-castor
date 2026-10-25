@@ -53,6 +53,9 @@ public final class CastV2Client implements Closeable {
     private volatile long lastPos;
     private volatile long lastDur;
     private volatile long lastPosAt;
+    // A GET_STATUS can race a SEEK and contain the old position; keep the requested target briefly.
+    private volatile long seekRequestedAt;
+    private volatile long seekRequestedPosition;
     private volatile float receiverVolume = -1f;
 
     public CastV2Client(Listener l) {
@@ -158,10 +161,19 @@ public final class CastV2Client implements Closeable {
         extra.put("currentTime", target / 1000.0);
         // Não force a retomada se o usuário estiver assistindo com a reprodução pausada.
         extra.put("resumeState", "PLAYBACK_UNCHANGED");
-        mediaCmd("SEEK", extra);
-        // Update locally before the receiver's asynchronous GET_STATUS can arrive.
+        // Set the expected target before sending. A status response may race the command and still
+        // report the old position; onMediaStatus() ignores that stale value for a short window.
+        long requestedAt = System.currentTimeMillis();
+        seekRequestedPosition = target;
+        seekRequestedAt = requestedAt;
         lastPos = target;
-        lastPosAt = System.currentTimeMillis();
+        lastPosAt = requestedAt;
+        try {
+            mediaCmd("SEEK", extra);
+        } catch (Exception e) {
+            seekRequestedAt = 0L;
+            throw e;
+        }
         requestStatus();
     }
 
@@ -330,16 +342,26 @@ public final class CastV2Client implements Closeable {
             lock.notifyAll();
         }
         lastState = s.optString("playerState", lastState);
+        long now = System.currentTimeMillis();
+        boolean stalePositionAfterSeek = false;
         if (s.has("currentTime")) {
             long reportedPos = (long) (s.optDouble("currentTime", 0) * 1000);
-            // Status messages from a receiver can briefly report 0 during transitions. Preserve
-            // a valid position unless the client itself explicitly sought to the beginning.
-            if (reportedPos > 0L || lastPos <= 5000L
-                    || "IDLE".equalsIgnoreCase(lastState) || "FINISHED".equalsIgnoreCase(lastState)) {
-                lastPos = reportedPos;
+            long seekAt = seekRequestedAt;
+            boolean awaitingSeekStatus = seekAt > 0L && now - seekAt < 5000L;
+            boolean terminalState = "IDLE".equalsIgnoreCase(lastState)
+                    || "FINISHED".equalsIgnoreCase(lastState);
+            if (awaitingSeekStatus && !terminalState
+                    && Math.abs(reportedPos - seekRequestedPosition) > 2500L) {
+                // Keep the target and its clock anchor; the receiver has not reported the seek yet.
+                stalePositionAfterSeek = true;
+            } else {
+                // Status messages can briefly report 0 during transitions. Preserve a valid position
+                // unless the client explicitly sought to the beginning or playback has finished.
+                if (reportedPos > 0L || lastPos <= 5000L || terminalState) lastPos = reportedPos;
+                if (awaitingSeekStatus) seekRequestedAt = 0L;
             }
         }
-        lastPosAt = System.currentTimeMillis();
+        if (!stalePositionAfterSeek) lastPosAt = now;
         JSONObject media = s.optJSONObject("media");
         if (media != null && media.has("duration")) lastDur = (long) (media.optDouble("duration", 0) * 1000);
         if ("IDLE".equals(lastState) && "ERROR".equals(s.optString("idleReason"))) {

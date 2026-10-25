@@ -105,7 +105,7 @@ public final class PlaybackService extends MediaSessionService {
                 String ref = refererByUrl.get(uri);
                 if (ref == null || ref.isEmpty()) ref = fallbackReferer;
                 if (ref != null && !ref.isEmpty()) {
-                    Map<String, String> props = new HashMap<>(dataSpec.httpRequestProperties);
+                    Map<String, String> props = new HashMap<>(dataSpec.httpRequestHeaders);
                     props.put("Referer", ref);
                     try {
                         URI r = new URI(ref);
@@ -113,7 +113,7 @@ public final class PlaybackService extends MediaSessionService {
                             props.put("Origin", r.getScheme() + "://" + r.getHost());
                         }
                     } catch (Exception ignored) { }
-                    return dataSpec.buildUpon().setHttpRequestProperties(props).build();
+                    return dataSpec.buildUpon().setHttpRequestHeaders(props).build();
                 }
             }
             return dataSpec;

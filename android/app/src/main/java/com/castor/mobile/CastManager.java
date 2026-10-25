@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Orquestra descoberta de TVs, envio do vídeo (DLNA, Chromecast ou servidor Castor) e controle remoto. */
 public final class CastManager {
@@ -51,6 +52,8 @@ public final class CastManager {
         t.setDaemon(true);
         return t;
     });
+    // Keep polling from racing the TV while one or more seek commands are still in flight.
+    private final AtomicInteger pendingSeekCommands = new AtomicInteger();
     private final LocalProxy proxy = new LocalProxy();
     private final CopyOnWriteArrayList<CastDevice> devices = new CopyOnWriteArrayList<>();
 
@@ -640,6 +643,7 @@ public final class CastManager {
                 }
                 CastDevice d = active;
                 if (d == null || gen != pollGen) return;
+                if (pendingSeekCommands.get() > 0) continue;
                 if (d.kind == CastDevice.DLNA) {
                     String st = DlnaClient.transportState(d);
                     if (!st.isEmpty()) lastState = st.startsWith("PAUSED") ? "PAUSED" : st;
@@ -756,7 +760,39 @@ public final class CastManager {
     }
 
     public void seekTo(final long ms) {
-        commandExec.execute(() -> performSeekTo(ms));
+        CastDevice d = active;
+        if (d == null) return;
+        if (d.kind != CastDevice.DLNA && (d.kind != CastDevice.CHROMECAST || cc == null)) {
+            enqueueSeek(ms);
+            return;
+        }
+        long target = clampSeekTarget(ms, d);
+        // Update the remote UI immediately. The command itself can take several seconds on DLNA.
+        lastPos = target;
+        lastPosAt = System.currentTimeMillis();
+        if (d.kind == CastDevice.DLNA) ignoreDlnaPositionUntil = lastPosAt + 2200L;
+        enqueueSeek(target);
+        notifyState();
+    }
+
+    private long clampSeekTarget(long ms, CastDevice d) {
+        long duration = lastDur;
+        CastV2Client client = cc;
+        if (d.kind == CastDevice.CHROMECAST && client != null && client.duration() > 0) {
+            duration = client.duration();
+        }
+        return Math.max(0L, duration > 0 ? Math.min(ms, Math.max(0L, duration - 1000L)) : ms);
+    }
+
+    private void enqueueSeek(long target) {
+        pendingSeekCommands.incrementAndGet();
+        commandExec.execute(() -> {
+            try {
+                performSeekTo(target);
+            } finally {
+                pendingSeekCommands.decrementAndGet();
+            }
+        });
     }
 
     private void performSeekTo(long ms) {
@@ -794,30 +830,32 @@ public final class CastManager {
             notifyState();
         } catch (Exception e) {
             message("Erro ao avançar/retroceder: " + e.getMessage());
+        } finally {
+            if (d.kind == CastDevice.DLNA) {
+                ignoreDlnaPositionUntil = System.currentTimeMillis() + 2200L;
+            }
         }
     }
 
     public void seekBy(long deltaMs) {
-        // Resolve the base position inside the same command queue, so repeated 10-second taps
-        // accumulate instead of all using the same stale position.
-        commandExec.execute(() -> {
-            CastDevice d = active;
-            if (d == null) return;
-            long base = lastPos;
-            CastV2Client client = cc;
-            if (d.kind == CastDevice.CHROMECAST && client != null) {
-                long current = client.position();
-                if (current >= 0) base = current;
-            } else if (d.kind == CastDevice.DLNA) {
-                long now = System.currentTimeMillis();
-                if (lastState.toUpperCase(Locale.ROOT).startsWith("PLAY") && lastPosAt > 0) {
-                    base += Math.max(0L, now - lastPosAt);
-                }
-            }
-            long target = Math.max(0L, base + deltaMs);
-            if (lastDur > 0) target = Math.min(target, Math.max(0L, lastDur - 1000L));
-            performSeekTo(target);
-        });
+        CastDevice d = active;
+        if (d == null) return;
+        if (d.kind != CastDevice.DLNA && (d.kind != CastDevice.CHROMECAST || cc == null)) {
+            enqueueSeek(Math.max(0L, lastPos + deltaMs));
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long base = lastPos;
+        if (lastState.toUpperCase(Locale.ROOT).startsWith("PLAY") && lastPosAt > 0) {
+            base += Math.max(0L, now - lastPosAt);
+        }
+        long target = clampSeekTarget(Math.max(0L, base + deltaMs), d);
+        // Optimistic position makes repeated taps accumulate and prevents the slider snapping back.
+        lastPos = target;
+        lastPosAt = now;
+        if (d.kind == CastDevice.DLNA) ignoreDlnaPositionUntil = now + 2200L;
+        enqueueSeek(target);
+        notifyState();
     }
 
     public boolean supportsVolume() {
