@@ -602,11 +602,21 @@ public final class CastManager {
                 return "video/x-flv";
             case "M4V":
                 return "video/x-m4v";
-            case "ÁUDIO":
+            case "TS":
+                return "video/mp2t";
+            case "MP3":
+                return "audio/mpeg";
+            case "IMAGEM":
                 String u = m.url == null ? "" : m.url.toLowerCase(Locale.ROOT);
-                if (u.contains(".m4a")) return "audio/mp4";
-                if (u.contains(".ogg")) return "audio/ogg";
-                if (u.contains(".wav")) return "audio/wav";
+                if (u.endsWith(".png")) return "image/png";
+                if (u.endsWith(".gif")) return "image/gif";
+                if (u.endsWith(".webp")) return "image/webp";
+                return "image/jpeg";
+            case "ÁUDIO":
+                String a = m.url == null ? "" : m.url.toLowerCase(Locale.ROOT);
+                if (a.contains(".m4a")) return "audio/mp4";
+                if (a.contains(".ogg")) return "audio/ogg";
+                if (a.contains(".wav")) return "audio/wav";
                 return "audio/mpeg";
             default:
                 return "video/mp4";

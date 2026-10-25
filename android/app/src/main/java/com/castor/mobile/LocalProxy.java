@@ -1,10 +1,14 @@
 package com.castor.mobile;
 
+import android.net.Uri;
+
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
 import java.net.InetAddress;
@@ -42,10 +46,16 @@ public final class LocalProxy {
     private static final class Entry {
         final String url;
         final String referer;
+        final String filePath;
 
         Entry(String url, String referer) {
+            this(url, referer, null);
+        }
+
+        Entry(String url, String referer, String filePath) {
             this.url = url;
             this.referer = referer == null ? "" : referer;
+            this.filePath = filePath;
         }
     }
 
@@ -105,7 +115,14 @@ public final class LocalProxy {
         if (id == null) {
             id = Long.toString(System.nanoTime(), 36) + Long.toString(++counter, 36);
             byKey.put(key, id);
-            entries.put(id, new Entry(url, referer));
+            String filePath = null;
+            if (url != null && url.startsWith("file://")) {
+                try {
+                    filePath = Uri.parse(url).getPath();
+                } catch (Exception ignored) {
+                }
+            }
+            entries.put(id, new Entry(url, referer, filePath));
         }
         return "http://" + host + ":" + port() + "/s/" + id + extensionOf(url);
     }
@@ -207,6 +224,10 @@ public final class LocalProxy {
     }
 
     private void serve(OutputStream out, String method, Entry e, String range) throws IOException {
+        if (e.filePath != null) {
+            serveLocal(out, method, e.filePath, range);
+            return;
+        }
         HttpURLConnection conn = null;
         try {
             String target = e.url;
@@ -311,6 +332,71 @@ public final class LocalProxy {
         }
     }
 
+    private void serveLocal(OutputStream out, String method, String filePath, String range) throws IOException {
+        File f = new File(filePath);
+        if (!f.exists() || !f.isFile()) {
+            writeHead(out, 404, "Not Found", new String[][]{{"Content-Length", "0"}});
+            return;
+        }
+        long len = f.length();
+        long start = 0;
+        long end = len - 1;
+        int status = 200;
+        if (range != null && range.startsWith("bytes=")) {
+            String spec = range.substring(6).trim();
+            int dash = spec.indexOf('-');
+            try {
+                if (dash == 0) {
+                    long suffix = Long.parseLong(spec.substring(1));
+                    start = Math.max(0L, len - suffix);
+                } else if (dash > 0) {
+                    start = Long.parseLong(spec.substring(0, dash));
+                    String es = spec.substring(dash + 1);
+                    end = es.isEmpty() ? len - 1 : Math.min(Long.parseLong(es), len - 1);
+                }
+                if (start >= len || start > end) {
+                    writeHead(out, 416, "Range Not Satisfiable", new String[][]{
+                            {"Content-Range", "bytes */" + len}, {"Content-Length", "0"}});
+                    return;
+                }
+                status = 206;
+            } catch (Exception e) {
+                start = 0;
+                end = len - 1;
+                status = 200;
+            }
+        }
+        String mime = guessType(filePath.toLowerCase(Locale.ROOT));
+        boolean progressiveMedia = mime.startsWith("video/") || mime.startsWith("audio/");
+        java.util.List<String[]> h = new java.util.ArrayList<>();
+        h.add(new String[]{"Content-Type", mime});
+        h.add(new String[]{"Accept-Ranges", "bytes"});
+        h.add(new String[]{"transferMode.dlna.org", progressiveMedia ? "Interactive" : "Streaming"});
+        if (progressiveMedia) {
+            h.add(new String[]{"contentFeatures.dlna.org",
+                    "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=21F00000000000000000000000000000"});
+        }
+        h.add(new String[]{"Content-Length", String.valueOf(end - start + 1)});
+        if (status == 206) h.add(new String[]{"Content-Range", "bytes " + start + "-" + end + "/" + len});
+        writeHead(out, status, status == 206 ? "Partial Content" : "OK", h.toArray(new String[0][]));
+        if (method.equals("HEAD")) {
+            out.flush();
+            return;
+        }
+        try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
+            raf.seek(start);
+            byte[] buf = new byte[32768];
+            long remaining = end - start + 1;
+            while (remaining > 0) {
+                int n = raf.read(buf, 0, (int) Math.min(buf.length, remaining));
+                if (n < 0) break;
+                out.write(buf, 0, n);
+                remaining -= n;
+            }
+            out.flush();
+        }
+    }
+
     private static String guessType(String lowerPath) {
         if (lowerPath.endsWith(".mp4") || lowerPath.endsWith(".m4v")) return "video/mp4";
         if (lowerPath.endsWith(".webm")) return "video/webm";
@@ -319,6 +405,15 @@ public final class LocalProxy {
         if (lowerPath.endsWith(".aac")) return "audio/aac";
         if (lowerPath.endsWith(".mp3")) return "audio/mpeg";
         if (lowerPath.endsWith(".vtt")) return "text/vtt";
+        if (lowerPath.endsWith(".mkv")) return "video/x-matroska";
+        if (lowerPath.endsWith(".mov")) return "video/quicktime";
+        if (lowerPath.endsWith(".flv")) return "video/x-flv";
+        if (lowerPath.endsWith(".m4a")) return "audio/mp4";
+        if (lowerPath.endsWith(".ogg")) return "audio/ogg";
+        if (lowerPath.endsWith(".wav")) return "audio/wav";
+        if (lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")) return "image/jpeg";
+        if (lowerPath.endsWith(".png")) return "image/png";
+        if (lowerPath.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
         return "application/octet-stream";
     }
 

@@ -14,6 +14,7 @@ import androidx.media3.common.Player;
 import androidx.media3.common.TrackSelectionParameters;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.datasource.DataSource;
+import androidx.media3.datasource.DefaultDataSource;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.datasource.ResolvingDataSource;
 import androidx.media3.exoplayer.ExoPlayer;
@@ -23,6 +24,7 @@ import androidx.media3.session.MediaSessionService;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -95,23 +97,27 @@ public final class PlaybackService extends MediaSessionService {
                 .setConnectTimeoutMs(15000)
                 .setReadTimeoutMs(20000)
                 .setUserAgent(MainActivity.USER_AGENT_MOBILE);
-        DataSource.Factory perItem = () -> {
-            DefaultHttpDataSource ds = http.createDataSource();
-            return new ResolvingDataSource(ds, dataSpec -> {
-                String ref = refererByUrl.get(dataSpec.uri.toString());
+        // DefaultDataSource também serve file:// e content:// (mídia local), além de http(s).
+        DefaultDataSource.Factory base = new DefaultDataSource.Factory(this, http);
+        DataSource.Factory perItem = () -> new ResolvingDataSource(base.createDataSource(), dataSpec -> {
+            String uri = dataSpec.uri.toString();
+            if (uri.startsWith("http://") || uri.startsWith("https://")) {
+                String ref = refererByUrl.get(uri);
                 if (ref == null || ref.isEmpty()) ref = fallbackReferer;
                 if (ref != null && !ref.isEmpty()) {
-                    ds.setRequestProperty("Referer", ref);
+                    Map<String, String> props = new HashMap<>(dataSpec.httpRequestProperties);
+                    props.put("Referer", ref);
                     try {
                         URI r = new URI(ref);
                         if (r.getScheme() != null && r.getHost() != null) {
-                            ds.setRequestProperty("Origin", r.getScheme() + "://" + r.getHost());
+                            props.put("Origin", r.getScheme() + "://" + r.getHost());
                         }
                     } catch (Exception ignored) { }
+                    return dataSpec.buildUpon().setHttpRequestProperties(props).build();
                 }
-                return dataSpec;
-            });
-        };
+            }
+            return dataSpec;
+        });
 
         player = new ExoPlayer.Builder(this)
                 .setMediaSourceFactory(new DefaultMediaSourceFactory(perItem))

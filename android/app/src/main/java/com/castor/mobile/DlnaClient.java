@@ -152,8 +152,11 @@ public final class DlnaClient {
     // ---------------------------------------------------------------- controle
 
     public static void setUri(CastDevice d, String url, String title, String mime) throws IOException {
-        boolean audio = mime != null && mime.toLowerCase(Locale.ROOT).startsWith("audio/");
-        String objectClass = audio ? "object.item.audioItem.musicTrack" : "object.item.videoItem";
+        String m = mime == null ? "" : mime.toLowerCase(Locale.ROOT);
+        boolean audio = m.startsWith("audio/");
+        boolean image = m.startsWith("image/");
+        String objectClass = audio ? "object.item.audioItem.musicTrack"
+                : (image ? "object.item.imageItem.photo" : "object.item.videoItem");
         // Advertise seek support for progressive files. HLS is a playlist stream and is not
         // consistently seekable over generic DLNA renderers.
         boolean progressive = mime != null && !mime.toLowerCase(Locale.ROOT).contains("mpegurl")

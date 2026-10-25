@@ -35,6 +35,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
 import android.os.SystemClock;
+import android.provider.OpenableColumns;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -78,6 +79,8 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -119,6 +122,7 @@ public final class MainActivity extends Activity {
     private static int ACCENT_SOFT = 0xFF3A2528;
     private static int GREEN = 0xFF4CC38A;
     private static final int REQUEST_CUSTOM_ICON_IMAGE = 8751;
+    private static final int REQUEST_LOCAL_MEDIA = 8752;
 
     private static final int SCREEN_LIBRARY = 0;
     private static final int SCREEN_BROWSER = 1;
@@ -166,6 +170,9 @@ public final class MainActivity extends Activity {
     private TextView castBarText;
     private int screen = SCREEN_BROWSER;
     private int libraryTab = 0; // 0 = fila, 1 = favoritos, 2 = histórico
+    private int libraryExtra = 0; // 0 = abas, 1 = downloads, 2 = iptv, 3 = canais iptv
+    private String iptvOpen = "";
+    private String iptvOpenName = "";
     private String settingsPage = "";
     private String settingsQuery = "";
     private boolean rounded = true;
@@ -1985,6 +1992,10 @@ public final class MainActivity extends Activity {
                 boolean added = store.addToQueue(m);
                 Toast.makeText(this, added ? "Adicionado à fila" : "Já está na fila", Toast.LENGTH_SHORT).show();
             }));
+            box.addView(sheetRow(R.drawable.ic_storage, "Baixar vídeo", false, v -> {
+                dismissSheet();
+                downloadMedia(m);
+            }));
         }
         box.addView(sheetRow(R.drawable.ic_copy, "Copiar link", false, v -> {
             dismissSheet();
@@ -2017,7 +2028,27 @@ public final class MainActivity extends Activity {
 
     private void buildLibrary() {
         libraryBox.removeAllViews();
-        libraryBox.addView(screenHeader("Biblioteca", "Fila, favoritos e histórico", null));
+        if (libraryExtra != 0) {
+            buildLibraryExtra();
+            return;
+        }
+        libraryBox.addView(screenHeader("Biblioteca", "Fila, favoritos, downloads, IPTV e mídia local", null));
+
+        LinearLayout extras = new LinearLayout(this);
+        extras.setOrientation(LinearLayout.HORIZONTAL);
+        extras.addView(actionTile(R.drawable.ic_storage, "Downloads", false, v -> {
+            libraryExtra = 1;
+            buildLibrary();
+        }), tileLp());
+        extras.addView(actionTile(R.drawable.ic_tv, "IPTV", false, v -> {
+            libraryExtra = 2;
+            buildLibrary();
+        }), tileLp());
+        extras.addView(actionTile(R.drawable.ic_image, "Mídia local", false, v -> chooseLocalMedia()), tileLp());
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        elp.bottomMargin = dp(14);
+        libraryBox.addView(extras, elp);
+
         int nq = store.queue().size();
         int nf = store.bookmarks().size();
         String[] labels = {"Fila (" + nq + ")", "Favoritos (" + nf + ")", "Histórico"};
@@ -2031,6 +2062,305 @@ public final class MainActivity extends Activity {
         if (libraryTab == 0) buildQueueList();
         else if (libraryTab == 1) buildFavoritesList();
         else buildHistoryList();
+    }
+
+    private void buildLibraryExtra() {
+        String title = libraryExtra == 1 ? "Downloads" : "IPTV";
+        String sub = libraryExtra == 1
+                ? "Vídeos e áudios baixados do navegador"
+                : "Listas M3U/M3U8 com canais ao vivo";
+        LinearLayout back = softButton(R.drawable.ic_back, "Voltar", v -> {
+            libraryExtra = 0;
+            iptvOpen = "";
+            iptvOpenName = "";
+            buildLibrary();
+        });
+        libraryBox.addView(screenHeader(title, sub, back), new LinearLayout.LayoutParams(MATCH, WRAP));
+        if (libraryExtra == 1) buildDownloads();
+        else buildIptv();
+    }
+
+    private void buildDownloads() {
+        List<String[]> dl = store.downloads();
+        if (dl.isEmpty()) {
+            libraryBox.addView(emptyState(R.drawable.ic_storage, "Nenhum download",
+                    "Toque em ⋯ de um vídeo direto (MP4/WebM…) e escolha Baixar. HLS/DASH não podem ser baixados direto.",
+                    null, null));
+            return;
+        }
+        for (int i = 0; i < dl.size(); i++) {
+            final int idx = i;
+            final String[] e = dl.get(i);
+            String sub = e[2] == null || e[2].isEmpty() ? "arquivo" : FilterEngine.hostOfUrl(e[2]);
+            libraryBox.addView(listRow(firstLetter(e[0]), e[0], sub,
+                    v -> openDownload(e[1]),
+                    smallIcon(R.drawable.ic_open, ACCENT, v -> openDownload(e[1])),
+                    smallIcon(R.drawable.ic_close, MUTED, v -> {
+                        store.removeDownload(idx);
+                        buildLibrary();
+                    })));
+        }
+    }
+
+    private void openDownload(String uri) {
+        if (uri == null || uri.isEmpty()) return;
+        try {
+            Intent vi = new Intent(Intent.ACTION_VIEW);
+            vi.setDataAndType(Uri.parse(uri), "*/*");
+            vi.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(Intent.createChooser(vi, "Abrir download"));
+        } catch (Exception ex) {
+            Toast.makeText(this, "Nenhum app para abrir esse arquivo", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void buildIptv() {
+        List<String[]> lists = store.iptvLists();
+        LinearLayout add = tonalButton(R.drawable.ic_add, "Adicionar lista (M3U)", v -> promptAddIptv());
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(MATCH, dp(46));
+        alp.bottomMargin = dp(12);
+        libraryBox.addView(add, alp);
+
+        if (lists.isEmpty()) {
+            libraryBox.addView(emptyState(R.drawable.ic_tv, "Nenhuma lista IPTV",
+                    "Cole o endereço de uma lista M3U/M3U8 (por exemplo, um link de canais ao vivo) para começar.",
+                    "Adicionar lista", v -> promptAddIptv()));
+            return;
+        }
+
+        for (int i = 0; i < lists.size(); i++) {
+            final int idx = i;
+            final String[] l = lists.get(i);
+            boolean open = l[1].equals(iptvOpen);
+            LinearLayout header = listRow(firstLetter(l[0]), l[0], l[1],
+                    v -> {
+                        if (open) {
+                            iptvOpen = "";
+                            iptvOpenName = "";
+                        } else {
+                            iptvOpen = l[1];
+                            iptvOpenName = l[0];
+                            ensureIptvChannels(l[1], l[0]);
+                        }
+                        buildLibrary();
+                    },
+                    smallIcon(R.drawable.ic_close, MUTED, v -> {
+                        store.removeIptvList(idx);
+                        if (l[1].equals(iptvOpen)) {
+                            iptvOpen = "";
+                            iptvOpenName = "";
+                        }
+                        buildLibrary();
+                    }));
+            libraryBox.addView(header);
+
+            if (open) {
+                List<MediaItem> ch = store.iptvChannels(l[1]);
+                if (ch.isEmpty()) {
+                    TextView loading = text("Carregando canais…", 13, MUTED, false);
+                    loading.setPadding(dp(14), dp(6), dp(14), dp(10));
+                    libraryBox.addView(loading);
+                } else {
+                    TextView count = text(ch.size() + (ch.size() == 1 ? " canal" : " canais"), 12, MUTED, false);
+                    count.setPadding(dp(14), dp(4), dp(14), dp(6));
+                    libraryBox.addView(count);
+                    for (int c = 0; c < ch.size(); c++) {
+                        final int ci = c;
+                        final MediaItem m = ch.get(c);
+                        libraryBox.addView(listRow(String.valueOf(c + 1), m.title, m.type,
+                                v -> play(ch, ci),
+                                smallIcon(R.drawable.ic_play_arrow, ACCENT, v -> play(ch, ci)),
+                                smallIcon(R.drawable.ic_cast, TEXT, v -> CastUi.show(this, m, -1))));
+                    }
+                }
+            }
+        }
+    }
+
+    private void ensureIptvChannels(final String url, final String name) {
+        if (!store.iptvChannels(url).isEmpty()) return;
+        Toast.makeText(this, "Carregando canais…", Toast.LENGTH_SHORT).show();
+        io.execute(() -> {
+            try {
+                List<MediaItem> ch = Iptv.fetch(this, url);
+                store.saveIptvChannels(url, ch);
+            } catch (Exception e) {
+                final String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+                ui.post(() -> Toast.makeText(this, "Falha ao carregar a lista: " + msg, Toast.LENGTH_LONG).show());
+            }
+            ui.post(this::buildLibrary);
+        });
+    }
+
+    private void promptAddIptv() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), dp(8));
+        final EditText name = new EditText(this);
+        name.setHint("Nome (opcional)");
+        name.setSingleLine(true);
+        name.setTextColor(TEXT);
+        name.setHintTextColor(MUTED);
+        box.addView(name, new LinearLayout.LayoutParams(MATCH, dp(48)));
+        final EditText url = new EditText(this);
+        url.setHint("https://exemplo.com/lista.m3u8");
+        url.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        url.setSingleLine(true);
+        url.setTextColor(TEXT);
+        url.setHintTextColor(MUTED);
+        box.addView(url, new LinearLayout.LayoutParams(MATCH, dp(48)));
+        new AlertDialog.Builder(this, ThemePalette.dialogTheme(this))
+                .setTitle("Adicionar lista IPTV")
+                .setView(box)
+                .setPositiveButton("Adicionar", (d, w) -> {
+                    String n = name.getText().toString().trim();
+                    String u = url.getText().toString().trim();
+                    if (u.isEmpty()) {
+                        Toast.makeText(this, "Informe o endereço da lista", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    store.addIptvList(n, u);
+                    iptvOpen = u;
+                    iptvOpenName = n.isEmpty() ? u : n;
+                    ensureIptvChannels(u, iptvOpenName);
+                    buildLibrary();
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private void chooseLocalMedia() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.addView(sheetTitle("Mídia local"));
+        box.addView(sheetRow(R.drawable.ic_video, "Vídeo", false, v -> {
+            dismissSheet();
+            pickLocal("video/*");
+        }));
+        box.addView(sheetRow(R.drawable.ic_play_arrow, "Áudio", false, v -> {
+            dismissSheet();
+            pickLocal("audio/*");
+        }));
+        box.addView(sheetRow(R.drawable.ic_image, "Imagem", false, v -> {
+            dismissSheet();
+            pickLocal("image/*");
+        }));
+        showSheet(box);
+    }
+
+    private void pickLocal(String type) {
+        Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType(type);
+        try {
+            startActivityForResult(i, REQUEST_LOCAL_MEDIA);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "Nenhum app disponível para escolher arquivos", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void handleLocalMedia(final Uri uri) {
+        if (uri == null) return;
+        String name = queryName(uri);
+        if (name == null || name.isEmpty()) name = "mídia";
+        final String fname = name;
+        io.execute(() -> {
+            File dir = new File(getCacheDir(), "local");
+            if (!dir.exists()) dir.mkdirs();
+            String safe = fname.replaceAll("[\\\\/:*?\"<>|]", "_");
+            File out = new File(dir, System.currentTimeMillis() + "-" + safe);
+            try (InputStream in = getContentResolver().openInputStream(uri);
+                 FileOutputStream fos = new FileOutputStream(out)) {
+                if (in == null) throw new IOException("não foi possível abrir o arquivo");
+                byte[] buf = new byte[32768];
+                int n;
+                while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+            } catch (Exception e) {
+                ui.post(() -> Toast.makeText(this, "Falha ao abrir a mídia: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                return;
+            }
+            final MediaItem item = new MediaItem("file://" + out.getAbsolutePath(), fname, "", "", typeFromName(fname));
+            ui.post(() -> showLocalMediaActions(item));
+        });
+    }
+
+    private String queryName(Uri uri) {
+        try (android.database.Cursor c = getContentResolver().query(uri, null, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (i >= 0) {
+                    String n = c.getString(i);
+                    if (n != null && !n.isEmpty()) return n;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        String last = uri.getLastPathSegment();
+        return last == null ? "" : last;
+    }
+
+    private void showLocalMediaActions(final MediaItem item) {
+        boolean image = "IMAGEM".equals(item.type);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.addView(sheetTitle(item.title));
+        box.addView(sheetRow(R.drawable.ic_cast, "Transmitir para a TV", false, v -> {
+            dismissSheet();
+            CastUi.show(this, item, -1);
+        }));
+        if (!image) {
+            box.addView(sheetRow(R.drawable.ic_play_arrow, "Reproduzir no celular", false, v -> {
+                dismissSheet();
+                List<MediaItem> one = new ArrayList<>();
+                one.add(item);
+                play(one, 0);
+            }));
+        } else {
+            box.addView(sheetRow(R.drawable.ic_open, "Abrir em outro app", false, v -> {
+                dismissSheet();
+                try {
+                    Intent vi = new Intent(Intent.ACTION_VIEW);
+                    vi.setDataAndType(Uri.parse(item.url), "image/*");
+                    startActivity(Intent.createChooser(vi, "Abrir imagem"));
+                } catch (Exception e) {
+                    Toast.makeText(this, "Nenhum app para abrir a imagem", Toast.LENGTH_SHORT).show();
+                }
+            }));
+        }
+        showSheet(box);
+    }
+
+    private static String typeFromName(String name) {
+        String n = name == null ? "" : name.toLowerCase(Locale.ROOT);
+        if (n.endsWith(".m3u8") || n.endsWith(".m3u")) return "HLS";
+        if (n.endsWith(".mpd")) return "DASH";
+        if (n.endsWith(".webm")) return "WEBM";
+        if (n.endsWith(".mkv")) return "MKV";
+        if (n.endsWith(".mov")) return "MOV";
+        if (n.endsWith(".flv")) return "FLV";
+        if (n.endsWith(".m4v")) return "M4V";
+        if (n.endsWith(".mp4")) return "MP4";
+        if (n.endsWith(".mp3")) return "MP3";
+        if (n.endsWith(".ts")) return "TS";
+        if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png")
+                || n.endsWith(".gif") || n.endsWith(".webp")) return "IMAGEM";
+        if (n.endsWith(".m4a") || n.endsWith(".aac") || n.endsWith(".ogg")
+                || n.endsWith(".wav") || n.endsWith(".flac")) return "ÁUDIO";
+        return "MP4";
+    }
+
+    private void downloadMedia(final MediaItem m) {
+        if ("HLS".equals(m.type) || "DASH".equals(m.type)) {
+            Toast.makeText(this, "HLS/DASH não podem ser baixados direto no celular. Use o servidor Castor ou um site com link direto (MP4/WebM…).", Toast.LENGTH_LONG).show();
+            return;
+        }
+        Toast.makeText(this, "Baixando…", Toast.LENGTH_SHORT).show();
+        Downloads.start(this, m.url, m.title, m.referer, (ok, msg, uri) -> {
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+            if (ok && uri != null) {
+                store.addDownload(Downloads.fileName(m.url, m.title), uri, m.url);
+            }
+        });
     }
 
     private void buildQueueList() {
@@ -2832,7 +3162,12 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQUEST_CUSTOM_ICON_IMAGE || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        if (requestCode == REQUEST_LOCAL_MEDIA) {
+            handleLocalMedia(data.getData());
+            return;
+        }
+        if (requestCode != REQUEST_CUSTOM_ICON_IMAGE) return;
         Uri uri = data.getData();
         try {
             int flags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);

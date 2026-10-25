@@ -41,7 +41,11 @@ public final class Store {
     private static final String K_SEARCH = "search_engine";
     private static final String K_TEXT_ZOOM = "text_zoom";
     private static final String K_BOOKMARKS = "bookmarks";
+    private static final String K_DOWNLOADS = "downloads";
+    private static final String K_IPTV_LISTS = "iptv_lists";
+    private static final String K_IPTV_CHANNELS = "iptv_channels";
     private static final int BOOKMARKS_MAX = 200;
+    private static final int DOWNLOADS_MAX = 200;
 
     public static final String[] SEARCH_IDS = {"google", "duckduckgo", "bing", "brave", "ecosia", "startpage"};
     public static final String[] SEARCH_NAMES = {"Google", "DuckDuckGo", "Bing", "Brave Search", "Ecosia", "Startpage"};
@@ -393,5 +397,158 @@ public final class Store {
         } catch (JSONException ignored) {
         }
         return out;
+    }
+
+    // ---- downloads (vídeo/áudio baixados do navegador) ----
+    /** Cada item é {nome, uri, urlOrigem}. */
+    public List<String[]> downloads() {
+        List<String[]> out = new ArrayList<>();
+        try {
+            JSONArray a = new JSONArray(p.getString(K_DOWNLOADS, "[]"));
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.getJSONObject(i);
+                out.add(new String[]{o.optString("name"), o.optString("uri"), o.optString("url")});
+            }
+        } catch (JSONException ignored) {
+        }
+        return out;
+    }
+
+    public void addDownload(String name, String uri, String url) {
+        List<String[]> list = downloads();
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i)[1].equals(uri)) {
+                list.remove(i);
+                break;
+            }
+        }
+        list.add(0, new String[]{name == null ? "" : name, uri == null ? "" : uri, url == null ? "" : url});
+        while (list.size() > DOWNLOADS_MAX) list.remove(list.size() - 1);
+        JSONArray a = new JSONArray();
+        for (String[] e : list) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("name", e[0]);
+                o.put("uri", e[1]);
+                o.put("url", e[2]);
+                a.put(o);
+            } catch (JSONException ignored) {
+            }
+        }
+        p.edit().putString(K_DOWNLOADS, a.toString()).apply();
+    }
+
+    public void removeDownload(int index) {
+        List<String[]> list = downloads();
+        if (index < 0 || index >= list.size()) return;
+        list.remove(index);
+        JSONArray a = new JSONArray();
+        for (String[] e : list) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("name", e[0]);
+                o.put("uri", e[1]);
+                o.put("url", e[2]);
+                a.put(o);
+            } catch (JSONException ignored) {
+            }
+        }
+        p.edit().putString(K_DOWNLOADS, a.toString()).apply();
+    }
+
+    public void clearDownloads() { p.edit().remove(K_DOWNLOADS).apply(); }
+
+    // ---- IPTV (listas M3U/M3U8) ----
+    /** Cada lista é {nome, url}. */
+    public List<String[]> iptvLists() {
+        List<String[]> out = new ArrayList<>();
+        try {
+            JSONArray a = new JSONArray(p.getString(K_IPTV_LISTS, "[]"));
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.getJSONObject(i);
+                String name = o.optString("name");
+                String url = o.optString("url");
+                if (!url.isEmpty()) out.add(new String[]{name.isEmpty() ? url : name, url});
+            }
+        } catch (JSONException ignored) {
+        }
+        return out;
+    }
+
+    public void addIptvList(String name, String url) {
+        if (url == null || url.trim().isEmpty()) return;
+        List<String[]> list = iptvLists();
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i)[1].equals(url.trim())) {
+                list.remove(i);
+                break;
+            }
+        }
+        list.add(0, new String[]{name == null || name.trim().isEmpty() ? url.trim() : name.trim(), url.trim()});
+        JSONArray a = new JSONArray();
+        for (String[] e : list) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("name", e[0]);
+                o.put("url", e[1]);
+                a.put(o);
+            } catch (JSONException ignored) {
+            }
+        }
+        p.edit().putString(K_IPTV_LISTS, a.toString()).apply();
+    }
+
+    public void removeIptvList(int index) {
+        List<String[]> list = iptvLists();
+        if (index < 0 || index >= list.size()) return;
+        String url = list.get(index)[1];
+        list.remove(index);
+        JSONArray a = new JSONArray();
+        for (String[] e : list) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("name", e[0]);
+                o.put("url", e[1]);
+                a.put(o);
+            } catch (JSONException ignored) {
+            }
+        }
+        p.edit().putString(K_IPTV_LISTS, a.toString()).apply();
+        // remove também os canais em cache daquela lista
+        try {
+            JSONObject all = new JSONObject(p.getString(K_IPTV_CHANNELS, "{}"));
+            if (all.has(url)) {
+                all.remove(url);
+                p.edit().putString(K_IPTV_CHANNELS, all.toString()).apply();
+            }
+        } catch (JSONException ignored) {
+        }
+    }
+
+    /** Canais em cache de uma lista; vazio se nunca foi carregada. */
+    public List<MediaItem> iptvChannels(String url) {
+        List<MediaItem> out = new ArrayList<>();
+        if (url == null || url.isEmpty()) return out;
+        try {
+            JSONObject all = new JSONObject(p.getString(K_IPTV_CHANNELS, "{}"));
+            JSONArray a = all.optJSONArray(url);
+            if (a != null) {
+                for (int i = 0; i < a.length(); i++) out.add(MediaItem.fromJson(a.getJSONObject(i)));
+            }
+        } catch (JSONException ignored) {
+        }
+        return out;
+    }
+
+    public void saveIptvChannels(String url, List<MediaItem> channels) {
+        if (url == null || url.isEmpty()) return;
+        try {
+            JSONObject all = new JSONObject(p.getString(K_IPTV_CHANNELS, "{}"));
+            JSONArray a = new JSONArray();
+            for (MediaItem m : channels) a.put(m.toJson());
+            all.put(url, a);
+            p.edit().putString(K_IPTV_CHANNELS, all.toString()).apply();
+        } catch (JSONException ignored) {
+        }
     }
 }
