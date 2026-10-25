@@ -35,6 +35,24 @@ public final class Store {
     private static final String K_AUTO_PLAY = "auto_play";
     private static final String K_QUALITY = "quality_mode";
     private static final String K_CUSTOM_ICON = "custom_icon_uri";
+    private static final String K_ACCENT = "accent_index";
+    private static final String K_ROUNDED = "ui_rounded";
+    private static final String K_NAV_LABELS = "nav_labels";
+    private static final String K_SEARCH = "search_engine";
+    private static final String K_TEXT_ZOOM = "text_zoom";
+    private static final String K_BOOKMARKS = "bookmarks";
+    private static final int BOOKMARKS_MAX = 200;
+
+    public static final String[] SEARCH_IDS = {"google", "duckduckgo", "bing", "brave", "ecosia", "startpage"};
+    public static final String[] SEARCH_NAMES = {"Google", "DuckDuckGo", "Bing", "Brave Search", "Ecosia", "Startpage"};
+    private static final String[] SEARCH_URLS = {
+            "https://www.google.com/search?q=",
+            "https://duckduckgo.com/?q=",
+            "https://www.bing.com/search?q=",
+            "https://search.brave.com/search?q=",
+            "https://www.ecosia.org/search?q=",
+            "https://www.startpage.com/do/search?q="
+    };
     private static final int HISTORY_MAX = 300;
     private static final int POSITIONS_MAX = 400;
     private static final int TABS_MAX = 30;
@@ -51,7 +69,7 @@ public final class Store {
     public boolean desktop() { return p.getBoolean(K_DESKTOP, false); }
     public int noticeSeconds() { return p.getInt(K_SECONDS, 3); }
     public long filterTime() { return p.getLong(K_FILTER_TIME, 0L); }
-    public String theme() { return p.getString(K_THEME, "dark"); }
+    public String theme() { return p.getString(K_THEME, "system"); }
     public boolean autoPlay() { return p.getBoolean(K_AUTO_PLAY, false); }
     /** high, medium ou low */
     public String quality() { return p.getString(K_QUALITY, "high"); }
@@ -64,7 +82,7 @@ public final class Store {
     public void setNoticeSeconds(int v) { p.edit().putInt(K_SECONDS, v).apply(); }
     public void setFilterTime(long v) { p.edit().putLong(K_FILTER_TIME, v).apply(); }
     public void setTheme(String v) {
-        if (!"light".equals(v) && !"amoled".equals(v)) v = "dark";
+        if (!"light".equals(v) && !"amoled".equals(v) && !"system".equals(v)) v = "dark";
         p.edit().putString(K_THEME, v).apply();
     }
     public void setAutoPlay(boolean v) { p.edit().putBoolean(K_AUTO_PLAY, v).apply(); }
@@ -75,6 +93,92 @@ public final class Store {
     public void setCustomIconUri(String uri) {
         p.edit().putString(K_CUSTOM_ICON, uri == null ? "" : uri).apply();
     }
+
+    // ---- aparência e navegação (3.0) ----
+    /** Índice da cor de destaque (ver ThemePalette.ACCENT_NAMES). */
+    public int accent() { return p.getInt(K_ACCENT, 0); }
+    public void setAccent(int v) { p.edit().putInt(K_ACCENT, v).apply(); }
+    public boolean rounded() { return p.getBoolean(K_ROUNDED, true); }
+    public void setRounded(boolean v) { p.edit().putBoolean(K_ROUNDED, v).apply(); }
+    public boolean navLabels() { return p.getBoolean(K_NAV_LABELS, true); }
+    public void setNavLabels(boolean v) { p.edit().putBoolean(K_NAV_LABELS, v).apply(); }
+    /** Zoom do texto das páginas, em porcentagem (80 a 150). */
+    public int textZoom() { return p.getInt(K_TEXT_ZOOM, 100); }
+    public void setTextZoom(int v) { p.edit().putInt(K_TEXT_ZOOM, Math.max(80, Math.min(150, v))).apply(); }
+
+    public int searchIndex() {
+        String id = p.getString(K_SEARCH, "google");
+        for (int i = 0; i < SEARCH_IDS.length; i++) if (SEARCH_IDS[i].equals(id)) return i;
+        return 0;
+    }
+    public void setSearchIndex(int i) {
+        if (i < 0 || i >= SEARCH_IDS.length) i = 0;
+        p.edit().putString(K_SEARCH, SEARCH_IDS[i]).apply();
+    }
+    /** Endereço de busca do mecanismo escolhido, já terminando em "q=". */
+    public String searchUrl() { return SEARCH_URLS[searchIndex()]; }
+
+    // ---- favoritos ----
+    public List<String[]> bookmarks() {
+        List<String[]> out = new ArrayList<>();
+        try {
+            JSONArray a = new JSONArray(p.getString(K_BOOKMARKS, "[]"));
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.getJSONObject(i);
+                out.add(new String[]{o.optString("url"), o.optString("title")});
+            }
+        } catch (JSONException ignored) {
+        }
+        return out;
+    }
+
+    private void saveBookmarks(List<String[]> list) {
+        JSONArray a = new JSONArray();
+        for (String[] e : list) {
+            try {
+                JSONObject o = new JSONObject();
+                o.put("url", e[0]);
+                o.put("title", e[1]);
+                a.put(o);
+            } catch (JSONException ignored) {
+            }
+        }
+        p.edit().putString(K_BOOKMARKS, a.toString()).apply();
+    }
+
+    public boolean isBookmarked(String url) {
+        if (url == null || !url.startsWith("http")) return false;
+        String key = pageKey(url);
+        for (String[] e : bookmarks()) if (pageKey(e[0]).equals(key)) return true;
+        return false;
+    }
+
+    /** Liga/desliga o favorito da página. @return true se ficou favoritada. */
+    public boolean toggleBookmark(String url, String title) {
+        if (url == null || !url.startsWith("http")) return false;
+        List<String[]> list = bookmarks();
+        String key = pageKey(url);
+        for (int i = 0; i < list.size(); i++) {
+            if (pageKey(list.get(i)[0]).equals(key)) {
+                list.remove(i);
+                saveBookmarks(list);
+                return false;
+            }
+        }
+        list.add(0, new String[]{url, title == null ? "" : title});
+        while (list.size() > BOOKMARKS_MAX) list.remove(list.size() - 1);
+        saveBookmarks(list);
+        return true;
+    }
+
+    public void removeBookmark(int index) {
+        List<String[]> list = bookmarks();
+        if (index < 0 || index >= list.size()) return;
+        list.remove(index);
+        saveBookmarks(list);
+    }
+
+    public void clearBookmarks() { p.edit().remove(K_BOOKMARKS).apply(); }
 
     // ---- transmissão (cast) ----
     public boolean castProxy() { return p.getBoolean(K_CAST_PROXY, true); }

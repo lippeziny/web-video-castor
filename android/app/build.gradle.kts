@@ -10,8 +10,8 @@ android {
         applicationId = "com.castor.mobile"
         minSdk = 24
         targetSdk = 34
-        versionCode = 9
-        versionName = "2.2.4"
+        versionCode = 10
+        versionName = "3.0.0"
     }
 
     compileOptions {

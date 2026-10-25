@@ -153,7 +153,7 @@ public final class PlayerActivity extends AppCompatActivity {
         topLp.setMargins(dp(12), dp(22), dp(12), 0);
         controls.addView(top, topLp);
 
-        TextView back = pill("‹", 30, ThemePalette.TEXT, 0x662A2C2F);
+        TextView back = pill("‹", 30, Color.WHITE, 0x662A2C2F);
         top.addView(back, new LinearLayout.LayoutParams(dp(44), dp(42)));
         back.setOnClickListener(v -> { saveCurrent(); finish(); });
 
@@ -169,7 +169,7 @@ public final class PlayerActivity extends AppCompatActivity {
         titleLp.rightMargin = dp(8);
         top.addView(titleText, titleLp);
 
-        castBtn = pill("TV  ↗", 13, Color.WHITE, 0xDCA85F43);
+        castBtn = pill("TV  ↗", 13, ThemePalette.ON_ACCENT, ThemePalette.withAlpha(ThemePalette.ACCENT, 0xDC));
         top.addView(castBtn, new LinearLayout.LayoutParams(dp(74), dp(42)));
         castBtn.setOnClickListener(v -> openCast());
 
@@ -272,7 +272,7 @@ public final class PlayerActivity extends AppCompatActivity {
         actionsLp.topMargin = dp(4);
         bottom.addView(actions, actionsLp);
         TextView rewind = pill("↶ 10", 15, Color.WHITE, 0x572C2D30);
-        TextView pause = pill("Ⅱ", 24, Color.rgb(35, 31, 28), ThemePalette.ACCENT);
+        TextView pause = pill("Ⅱ", 24, ThemePalette.ON_ACCENT, ThemePalette.ACCENT);
         playBtn = pause;
         TextView forward = pill("10 ↷", 15, Color.WHITE, 0x572C2D30);
         LinearLayout.LayoutParams leftRight = new LinearLayout.LayoutParams(0, dp(48), 1f);

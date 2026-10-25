@@ -1,4 +1,4 @@
-# Castor Android Browser 2.1
+# Castor Android Browser 3.0
 
 Navegador Android (Java + WebView + Media3/ExoPlayer) com detecção de vídeos, fila de reprodução e bloqueio de anúncios, pop-ups e redirecionamentos.
 
@@ -9,6 +9,10 @@ Navegador Android (Java + WebView + Media3/ExoPlayer) com detecção de vídeos,
 - **Painel Block ADS:** chaves *Popup*, *Redirect* e *Ads* (todas ligadas por padrão), botão **Force search** (força a busca de vídeos na página), modo desktop e engrenagem de **mais configurações**.
 - **Página inicial** com atalhos de serviços (Google, YouTube, Prime Video etc.).
 - **Aviso de bloqueio:** mostra o link com **Abrir** / **Ignorar**; some em 3 s (configurável de 0 a 15 s; 0 = fica até escolher).
+
+## Novidades da 3.0
+
+Redesign completo da interface (temas Sistema/Claro/Escuro/AMOLED, 9 cores de destaque, barra inferior flutuante, painéis deslizantes, favoritos, botão flutuante de vídeos e nova tela de configurações com busca). Detalhes em `android/CHANGELOG-3.0.0.md`.
 
 ## Novidades da 2.1
 
